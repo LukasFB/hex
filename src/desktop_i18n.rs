@@ -379,6 +379,7 @@ const TRANSLATIONS: &[(&str, [&str; 5])] = &[
     ("Add", ["Dodaj", "添加", "追加", "Hinzufügen", "Añadir"]),
     ("Add Application", ["Dodaj aplikację", "添加应用", "アプリを追加", "App hinzufügen", "Añadir aplicación"]),
     ("Add a key", ["Dodaj klawisz", "添加一个按键", "キーを追加してください", "Taste hinzufügen", "Añade una tecla"]),
+    ("Configure mouse shortcuts in your Wayland desktop using the hex commands", ["Skonfiguruj skróty myszy w ustawieniach pulpitu Wayland za pomocą poleceń hex", "使用 hex 命令在 Wayland 桌面设置中配置鼠标快捷键", "hex コマンドを使って Wayland デスクトップでマウスショートカットを設定してください", "Maus-Shortcuts in den Wayland-Desktop-Einstellungen mit den hex-Befehlen konfigurieren", "Configura los atajos del ratón en tu escritorio Wayland mediante los comandos hex"]),
     ("Add a key Linux can register", ["Dodaj klawisz, który Linux może zarejestrować", "添加一个 Linux 可以注册的按键", "Linux で登録できるキーを追加してください", "Taste hinzufügen, die Linux registrieren kann", "Añade una tecla que Linux pueda registrar"]),
     ("Add a modifier", ["Dodaj modyfikator", "添加一个修饰键", "修飾キーを追加してください", "Sondertaste hinzufügen", "Añade un modificador"]),
     ("Already in use", ["Już w użyciu", "已被使用", "すでに使用されています", "Bereits belegt", "Ya está en uso"]),
