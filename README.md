@@ -260,6 +260,21 @@ first, uninstalling, and building from source. It also describes
 requirements and limitations.
 For Nix/NixOS packaging and per-user autostart, see the [Nix guide](docs/nix.md).
 
+## Local macOS Builds
+
+`scripts/build-app.sh` builds `target/app/Hex.app` with a Developer ID identity
+from the local keychain. If more than one Developer ID name is available, set
+`VOICE_CONTROL_TEAM_ID` (and optionally `VOICE_CONTROL_CODESIGN_IDENTITY`, a name
+or certificate hash). Missing or ambiguous identities fail instead of falling
+back to ad-hoc signing, so normal rebuilds retain a stable signing requirement.
+Only the separate `HEX_TEST_BUILD=1` app uses ad-hoc signing.
+Release and notarization scripts retain their signing requirements.
+
+Use the full Xcode installation for the Swift bridges and Metal compiler. If
+`xcode-select -p` points at Command Line Tools, set
+`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for build and check
+commands. Install the model/runtime dependencies with `scripts/setup.sh` first.
+
 ## Testing Builds
 
 Every push to `main` produces unsigned test builds for macOS, Windows, and

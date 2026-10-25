@@ -88,6 +88,16 @@ Headless Chromium renders of the WebGPU, Canvas 2D, reduced-motion and phone pat
 showed no console errors; a deterministic 60 fps capture was reviewed frame by
 frame. These checks do not exercise real speakers or a physical phone.
 
+Local macOS `scripts/build-app.sh` builds now require a certificate-backed
+Developer ID identity. A unique identity name is selected from the keychain;
+`VOICE_CONTROL_TEAM_ID` and optionally `VOICE_CONTROL_CODESIGN_IDENTITY`
+(name or hash) resolve ambiguity. Duplicate certificates with the same name use
+one explicit hash. Missing or ambiguous identities fail instead of silently
+using ad-hoc signing; only the separate Hex Test app remains ad-hoc. The identity
+fixtures check selection, duplicates, overrides and refusal. Keeping the same
+signing requirement permits permission continuity across rebuilds; switching
+from an earlier ad-hoc app can still require a new grant.
+
 The Windows installer is silently installed, reinstalled, refused as a
 downgrade, and uninstalled on x64 and ARM64 runners by
 [test-windows-installer.ps1](../../scripts/test-windows-installer.ps1); no

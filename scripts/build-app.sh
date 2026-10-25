@@ -12,8 +12,8 @@ if [ "${HEX_TEST_BUILD:-}" = 1 ]; then
   app_name="Hex Test"
   bundle_id=anomaly.hex.test
 else
-  team_id=${VOICE_CONTROL_TEAM_ID:?Set VOICE_CONTROL_TEAM_ID to the Apple Developer signing team}
-  identity=$(hex_codesign_identity "$team_id")
+  team_id=${VOICE_CONTROL_TEAM_ID:-}
+  identity=$(hex_local_codesign_identity)
   app_name=Hex
   bundle_id=anomaly.hex
 fi

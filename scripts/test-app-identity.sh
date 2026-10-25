@@ -35,7 +35,9 @@ expect_rejection 'wrong bundle identifier'
 /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable voice-control-watch' "$plist"
 expect_rejection 'wrong executable name'
 
-for script in build-app.sh build-service-app.sh release-app.sh; do
+# Local apps require a certificate-backed identity; distributed helpers and
+# releases additionally require an explicit Developer ID team.
+for script in build-service-app.sh release-app.sh; do
   if output=$(env -u VOICE_CONTROL_TEAM_ID sh "$root/scripts/$script" 2>&1); then
     echo "Unexpectedly allowed $script without an explicit signing team." >&2
     exit 1
@@ -59,4 +61,30 @@ if output=$(env -u HEX_NOTARY_PROFILE sh "$root/scripts/prepare-service-app.sh" 
 fi
 printf '%s\n' "$output" | grep -Fq 'Set HEX_NOTARY_PROFILE to the matching notarization profile'
 
+# Exercise local identity selection without signing anything or using the keychain.
+mkdir -p "$temporary/bin"
+cat > "$temporary/bin/security" <<'MOCK'
+#!/bin/sh
+cat "$HEX_SIGNING_FIXTURE"
+MOCK
+chmod +x "$temporary/bin/security"
+(
+  PATH="$temporary/bin:$PATH"
+  export PATH HEX_SIGNING_FIXTURE="$temporary/identities"
+  unset VOICE_CONTROL_TEAM_ID VOICE_CONTROL_CODESIGN_IDENTITY
+  . "$root/scripts/macos-signing.sh"
+  printf '%s\n' ' 1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Developer ID Application: Fixture (TESTTEAM00)"' \
+    ' 2) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB "Developer ID Application: Fixture (TESTTEAM00)"' > "$HEX_SIGNING_FIXTURE"
+  [ "$(hex_local_codesign_identity)" = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ]
+  [ "$(VOICE_CONTROL_CODESIGN_IDENTITY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB hex_local_codesign_identity)" = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB ]
+  printf '%s\n' ' 3) CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC "Developer ID Application: Other (OTHERTEAM0)"' >> "$HEX_SIGNING_FIXTURE"
+  if hex_local_codesign_identity >/dev/null 2>&1; then
+    echo "Ambiguous local identity unexpectedly accepted" >&2; exit 1
+  fi
+  [ "$(VOICE_CONTROL_TEAM_ID=TESTTEAM00 hex_local_codesign_identity)" = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ]
+  : > "$HEX_SIGNING_FIXTURE"
+  if hex_local_codesign_identity >/dev/null 2>&1; then
+    echo "Missing local identity unexpectedly accepted" >&2; exit 1
+  fi
+)
 echo "Rust app identity guards passed."

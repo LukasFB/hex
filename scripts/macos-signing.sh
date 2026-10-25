@@ -45,3 +45,25 @@ hex_version() {
 hex_build_number() {
   printf '%s\n' "${HEX_BUILD_NUMBER:-$(printf '%s\n' "${1%%-*}" | awk -F. '{ print ($1 * 10000) + ($2 * 100) + $3 }')}"
 }
+
+# The locally installed app needs a certificate-backed identity across rebuilds.
+# Multiple certificates for the same Developer ID are equivalent for its default
+# designated requirement; choose a hash so duplicate names cannot confuse codesign.
+hex_local_codesign_identity() {
+    requested_team=${VOICE_CONTROL_TEAM_ID:-}
+    requested_identity=${VOICE_CONTROL_CODESIGN_IDENTITY:-}
+    matches=$(security find-identity -v -p codesigning | awk -F '"' \
+        -v team="$requested_team" -v wanted="$requested_identity" '
+        $2 ~ /^Developer ID Application: .*\([A-Z0-9]+\)$/ {
+            split($1, fields, " "); hash = fields[2]; name = $2;
+            if (team != "" && substr(name, length(name) - length(team)) != team ")") next;
+            if (wanted != "" && wanted != hash && wanted != name) next;
+            if (!(name in seen)) { seen[name] = 1; count++; selected = hash; }
+        }
+        END { if (count == 1) print selected; }')
+    if [ -z "$matches" ]; then
+        echo "Signing identity is not a Developer ID Application identity for team $requested_team, or selection is ambiguous. Set VOICE_CONTROL_TEAM_ID and optionally VOICE_CONTROL_CODESIGN_IDENTITY. Refusing ad-hoc signing for Hex.app." >&2
+        return 1
+    fi
+    printf '%s\n' "$matches"
+}
