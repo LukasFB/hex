@@ -58,6 +58,7 @@ pub(super) struct Capabilities {
     pub(super) hud_lab: bool,
     /// Modifier-only shortcuts can require the left or right key (macOS).
     pub(super) modifier_sides: bool,
+    pub(super) duck_audio: bool,
 }
 
 impl Capabilities {
@@ -76,6 +77,7 @@ impl Capabilities {
         fun: false,
         hud_lab: false,
         modifier_sides: false,
+        duck_audio: false,
     };
 
     pub(super) const MACOS: Self = Self {
@@ -93,6 +95,7 @@ impl Capabilities {
         fun: true,
         hud_lab: true,
         modifier_sides: true,
+        duck_audio: true,
     };
 
     pub(super) const WINDOWS: Self = Self {
@@ -110,6 +113,7 @@ impl Capabilities {
         fun: false,
         hud_lab: false,
         modifier_sides: false,
+        duck_audio: false,
     };
 
     /// This OS's capabilities, with the rows its window host decides.

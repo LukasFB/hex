@@ -18,6 +18,8 @@ use objc2_core_foundation::CFString;
 
 use crate::app_settings::{self, RecordingAudioBehavior};
 
+mod ducking;
+
 const VIRTUAL_MAIN_VOLUME: u32 = u32::from_be_bytes(*b"vmvc");
 const POWER_ASSERTION_LEVEL_ON: u32 = 255;
 
@@ -109,7 +111,10 @@ impl Environment for RecordingEnvironment {
             _audio: audio,
         } = self;
         drop(sleep);
-        if matches!(audio, AudioBehaviorGuard::Muted { .. }) {
+        if matches!(
+            audio,
+            AudioBehaviorGuard::Muted { .. } | AudioBehaviorGuard::Ducked(_)
+        ) {
             drop(audio);
             then();
         } else {
@@ -356,6 +361,7 @@ unsafe extern "C" {
 }
 
 enum AudioBehaviorGuard {
+    Ducked(ducking::Guard),
     Muted { device: u32, previous: f32 },
     Paused { players: Vec<MediaPlayer> },
     None,
@@ -364,6 +370,10 @@ enum AudioBehaviorGuard {
 impl AudioBehaviorGuard {
     fn start(behavior: RecordingAudioBehavior) -> Self {
         match behavior {
+            RecordingAudioBehavior::Duck => {
+                ducking::Guard::start(app_settings::recording_duck_volume())
+                    .map_or(Self::None, Self::Ducked)
+            }
             RecordingAudioBehavior::Mute => {
                 mute_output().map_or(Self::None, |(device, previous)| {
                     tracing::info!(previous, "muted system output for dictation");
@@ -394,6 +404,7 @@ impl Drop for AudioBehaviorGuard {
                     tracing::info!(volume = *previous, "restored system output after dictation");
                 }
             }
+            Self::Ducked(guard) => guard.restore(),
             Self::Paused { players } => resume_media(players),
             Self::None => {}
         }
