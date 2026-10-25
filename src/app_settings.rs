@@ -268,7 +268,38 @@ pub struct HotkeyKey {
     pub label: String,
 }
 
+/// Reserved input codes for the 32 mouse buttons CoreGraphics can report.
+const MOUSE_INPUT_CODES: std::ops::Range<u16> = 0x8000..0x8020;
+
 impl HotkeyKey {
+    /// macOS mouse buttons occupy a separate input-code range, beyond every
+    /// native keyboard code used by macOS. A shared trigger code lets keyboard
+    /// and mouse bindings use the same hold, toggle, conflict and persistence
+    /// rules. UI labels are one-based (Mouse 1 = left, Mouse 2 = right, Mouse 3 = middle).
+    #[cfg(target_os = "macos")]
+    pub fn mouse(button: u16) -> Option<Self> {
+        Self::mouse_code(button).map(|code| Self {
+            code,
+            label: format!("Mouse {}", button + 1),
+        })
+    }
+
+    /// Allocation-free encoding for the event tap.
+    #[cfg(target_os = "macos")]
+    pub fn mouse_code(button: u16) -> Option<u16> {
+        (button < 32).then(|| MOUSE_INPUT_CODES.start + button)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn mouse_button(code: u16) -> Option<u16> {
+        code.checked_sub(MOUSE_INPUT_CODES.start)
+            .filter(|button| *button < 32)
+    }
+
+    pub fn is_mouse(&self) -> bool {
+        cfg!(target_os = "macos") && MOUSE_INPUT_CODES.contains(&self.code)
+    }
+
     /// A key identified by name on Windows and Linux.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn named(name: &str) -> Self {

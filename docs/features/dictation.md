@@ -20,7 +20,27 @@ injects a failed shortcut save yet.
 **Shortcut:** Option by default, after macOS permissions and the selected local
 model are ready. Commands and OpenCode are not required. General > Dictation >
 Shortcut accepts modifier-only, modifier-plus-key, standalone Fn/Globe, and
-standalone function-key bindings. Capturing a replacement suspends global matching.
+standalone function-key bindings. On macOS it also accepts mouse buttons,
+alone or with modifiers: click Record, then press the desired mouse button.
+Mouse 1/2/3 are left/right/middle; Mouse 4 and higher are auxiliary buttons.
+Escape cancels recording a binding. Mouse bindings use the same hold, toggle,
+and double-tap rules and conflict checks as keyboard bindings. A consumed
+mouse press, drag and release do not reach the foreground app; ordinary clicks
+retain their existing behavior. Capturing a replacement suspends global matching.
+The CLI accepts the same bindings, for example `mouse4` or `option+mouse4`.
+Windows and Linux mouse capture are not implemented.
+
+Checks: `mouse_buttons_record_with_or_without_modifiers`,
+`mouse_bindings_persist_and_conflict_only_with_the_same_trigger`,
+`mouse_hold_and_release_use_the_dictation_state_machine`,
+`mouse_double_tap_locks_and_a_fresh_press_finishes`,
+`mouse_toggle_and_escape_use_the_same_capture_controls`,
+`mouse_held_during_stale_keyboard_recovery_is_not_forgotten`,
+`mouse_release_stays_balanced_after_its_binding_is_removed`, and
+`mouse_suppression_balances_release_and_drag_even_after_modifiers_change`.
+These reducer/recorder checks passed on October 25, 2026, with the full macOS
+`scripts/check` suite; they are not physical mouse end-to-end proof.
+
 On macOS and Windows the recorder shows the modifiers held so far (`⌥ ⌘ …`);
 a key records them at once, and releasing them all records the most held.
 Checks: `a_recorder_shows_the_modifiers_held_so_far` in `rune_ui/tests.rs` and

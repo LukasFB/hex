@@ -253,7 +253,8 @@ an unsaved edit.
 - Booleans take `on`/`off`, `true`/`false`, `yes`/`no`, or `1`/`0`.
 - Optional settings take `none` to clear them.
 - Shortcuts take text such as `option`, `right-command`, `option+shift+v`,
-  `control+space`, `fn`, or `f5`. Key names resolve on the active keyboard
+  `control+space`, `fn`, or `f5`. On macOS, `mouse4` and `option+mouse4`
+  also work (Mouse 1/2/3 are left/right/middle). Key names resolve on the active keyboard
   layout, the OS's rules for Settings' recorder apply, and a binding another
   Hex shortcut uses is refused with `shortcut-in-use`. `double_tap_only`
   needs a key chord, as in Settings.
