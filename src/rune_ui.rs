@@ -499,6 +499,7 @@ pub(crate) struct Ui {
     preparing: Option<(TranscriptionModelId, Instant)>,
     /// When a text field last changed without being saved.
     draft_since: Option<Instant>,
+    duck_volume_drag: Option<f32>,
     models: models::Models,
     voice_action_error: Option<String>,
     history: history::HistoryPane,
@@ -567,6 +568,7 @@ impl Ui {
             vocabulary,
             preparing: None,
             draft_since: None,
+            duck_volume_drag: None,
             models: models::Models::default(),
             voice_action_error: None,
             history: history::HistoryPane::default(),
@@ -1423,6 +1425,10 @@ const SCENES: &[Scene] = &[
     }),
     // macOS and Windows surfaces, from preview data (see `platform`).
     ("mac-settings", |ui| *ui = mac_fixture()),
+    ("mac-settings-ducking", |ui| {
+        *ui = mac_fixture();
+        ui.settings.recording_audio_behavior = crate::app_settings::RecordingAudioBehavior::Duck;
+    }),
     ("mac-settings-vocabulary", |ui| {
         *ui = mac_fixture();
         vocabulary::fixture(ui, true);

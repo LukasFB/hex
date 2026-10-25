@@ -11,6 +11,7 @@ use super::controls::{
     icon_button, keycap, keycaps, link_row, note, pulsing_dot, section, segmented, select,
     setting_row, sheet_button, status_dot, text_field, toggle_row,
 };
+use super::lists::slider;
 use super::{Menu, Request, Service, ShortcutTarget, Ui};
 use super::{explainer, host};
 use crate::app_settings::{
@@ -1073,11 +1074,15 @@ fn output_section(ui: &Ui, p: Paint) -> El {
         rows.push(shortcut_row(ui, p, ShortcutTarget::PasteLast));
         rows.extend(refused_note(ui, p, ShortcutTarget::PasteLast));
     }
-    let audio_labels: Vec<&str> = RecordingAudioBehavior::ALL
+    let behaviors: Vec<_> = RecordingAudioBehavior::ALL
+        .into_iter()
+        .filter(|behavior| *behavior != RecordingAudioBehavior::Duck || ui.platform.caps.duck_audio)
+        .collect();
+    let audio_labels: Vec<&str> = behaviors
         .iter()
         .map(|behavior| tr(behavior.label()))
         .collect();
-    let audio_index = RecordingAudioBehavior::ALL
+    let audio_index = behaviors
         .iter()
         .position(|behavior| *behavior == settings.recording_audio_behavior)
         .unwrap_or(2);
@@ -1091,14 +1096,45 @@ fn output_section(ui: &Ui, p: Paint) -> El {
             "while-dictating-control",
             &audio_labels,
             audio_index,
-            |ui, index| {
-                let behavior = RecordingAudioBehavior::ALL[index];
+            move |ui, index| {
+                let behavior = behaviors[index];
                 if ui.settings.recording_audio_behavior != behavior {
                     ui.update(|settings| settings.recording_audio_behavior = behavior);
                 }
             },
         ),
     ));
+    if ui.platform.caps.duck_audio
+        && settings.recording_audio_behavior == RecordingAudioBehavior::Duck
+    {
+        rows.push(setting_row(
+            p,
+            "recording-duck-volume",
+            tr("Lower to"),
+            Some(tr("Percent of the current output volume")),
+            slider(
+                p,
+                "recording-duck-slider",
+                tr("Volume while recording"),
+                ui.duck_volume_drag
+                    .unwrap_or(settings.recording_duck_volume),
+                format!(
+                    "{:.0}%",
+                    ui.duck_volume_drag
+                        .unwrap_or(settings.recording_duck_volume)
+                        * 100.0
+                ),
+                200.0,
+                |ui, value, done| {
+                    let value = (value * 100.0).round() / 100.0;
+                    ui.duck_volume_drag = if done { None } else { Some(value) };
+                    if done {
+                        ui.update(|settings| settings.recording_duck_volume = value);
+                    }
+                },
+            ),
+        ));
+    }
     let indicator_index = match settings.indicator_position {
         IndicatorPosition::Top => 0,
         IndicatorPosition::Bottom => 1,
