@@ -96,7 +96,9 @@ impl Backend {
             Request::Desktop(
                 action @ (DesktopAction::CheckForUpdates
                 | DesktopAction::OpenUpdate
-                | DesktopAction::RestartIntoUpdate),
+                | DesktopAction::RestartIntoUpdate
+                | DesktopAction::ConfirmUpdateSwitch
+                | DesktopAction::WindowFocused),
             ) => crate::macos_rune::update_action(&action),
             request => match &self.runtime {
                 Some(runtime) => runtime.send(request),
@@ -416,8 +418,25 @@ pub(super) fn hotkey_key_named(name: &str) -> Result<HotkeyKey, &'static str> {
     }
 }
 
-/// macOS accepts every binding the capture can produce.
-pub(super) fn validate_hotkey(_: ShortcutTarget, _: &HotkeyBinding) -> Result<(), &'static str> {
+/// macOS accepts every binding the capture can produce, except that Paste
+/// Last fires only on a key press (`suppression::paste_action`), and the
+/// capture shortcut, pressed once to start and again to finish, and the
+/// send-to list's need a key.
+pub(super) fn validate_hotkey(
+    target: ShortcutTarget,
+    binding: &HotkeyBinding,
+) -> Result<(), &'static str> {
+    if target == ShortcutTarget::PasteLast && binding.key.is_none() {
+        return Err(tr("Add a key"));
+    }
+    #[cfg(hex_capture)]
+    if matches!(
+        target,
+        ShortcutTarget::Capture | ShortcutTarget::CaptureList
+    ) && binding.key.is_none()
+    {
+        return Err(tr("Add a key"));
+    }
     Ok(())
 }
 
@@ -469,6 +488,8 @@ struct MacHost {
     /// The meetings folder panel, while it is open.
     folder_choice: Option<crate::file_dialog::Pending>,
     calendar: CalendarFeed,
+    #[cfg(hex_capture)]
+    scrawl: ScrawlHost,
 }
 
 impl MacHost {
@@ -490,6 +511,8 @@ impl MacHost {
             practice: None,
             folder_choice: None,
             calendar: CalendarFeed::default(),
+            #[cfg(hex_capture)]
+            scrawl: ScrawlHost::default(),
         };
         let _ = host.request_login(LoginItemRequest::Status);
         host
@@ -561,7 +584,13 @@ impl NativeHost for MacHost {
                 crate::onboarding::request_microphone();
             }
             PlatformRequest::Permission(PermissionAction::ShowGuide(kind)) => {
-                crate::permission_guide::show(kind);
+                // Screen Recording may have been granted since the last
+                // refresh; the refresh below then shows Allowed.
+                if kind != PermissionKind::ScreenRecording
+                    || !crate::meeting::screen_recording_permitted()
+                {
+                    crate::permission_guide::show(kind);
+                }
             }
             PlatformRequest::Permission(PermissionAction::Restart) => {
                 if !crate::onboarding::spawn_relaunch() {
@@ -631,6 +660,15 @@ impl NativeHost for MacHost {
                 DemoRequest::StopPlayback => crate::hex_microphone::stop_demo_playback(),
             },
             PlatformRequest::ConfigureHud(lab) => configure_hud(&self.runtime()?, lab),
+            PlatformRequest::TuneHud(lab) => tune_hud(&self.runtime()?, lab),
+            PlatformRequest::EndHudDemo => self
+                .runtime()?
+                .indicator(crate::dictation_indicator::DictationIndicatorEvent::Reset),
+            PlatformRequest::SaveDotScope(tuning) => {
+                tuning.save().map_err(|error| format!("{error:#}"))?;
+            }
+            #[cfg(hex_capture)]
+            PlatformRequest::Scrawl(request) => self.scrawl.send(request),
         }
         // Show the result of an action at once, not on the next refresh.
         self.refresh_at = Instant::now();
@@ -639,6 +677,14 @@ impl NativeHost for MacHost {
 
     fn poll(&mut self, state: &mut PlatformState) -> bool {
         let mut changed = false;
+        // The playground's HUD stories change the tuning HUD Lab shows.
+        if let Some(tuning) = state.hud.dot_scope {
+            let shared = crate::dot_scope::lab();
+            if shared != tuning {
+                state.hud.dot_scope = Some(shared);
+                changed = true;
+            }
+        }
         if let Some(login) = &mut self.login {
             match login.poll() {
                 Ok(Some(answer)) => {
@@ -699,10 +745,28 @@ impl NativeHost for MacHost {
             state.demo = Some(crate::hex_microphone::demo_snapshot());
             changed = true;
         }
+        #[cfg(hex_capture)]
+        {
+            changed |= self.scrawl.poll(state, Instant::now() >= self.refresh_at);
+        }
         if Instant::now() < self.refresh_at {
             return changed;
         }
         self.refresh_at = Instant::now() + PLATFORM_REFRESH;
+        // Input sources are read only while keyboard model switching is on.
+        let switching = crate::macos_rune::runtime()
+            .and_then(|runtime| runtime.published())
+            .is_some_and(|published| published.settings.keyboard_model_switching.enabled);
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            changed |= update(
+                &mut state.input_sources,
+                if switching {
+                    crate::keyboard_input_sources::enabled(mtm)
+                } else {
+                    Vec::new()
+                },
+            );
+        }
         changed |= self.calendar.poll(&mut state.calendar);
         changed |= update(
             &mut state.tuning,
@@ -727,11 +791,9 @@ impl NativeHost for MacHost {
         let asked_len = state.permissions_asked.len();
         state.permissions_asked.retain(|kind| match kind {
             PermissionKind::Microphone => permissions.microphone != PermissionState::Ready,
-            PermissionKind::InputMonitoring => {
-                permissions.input_monitoring != PermissionState::Ready
-            }
             PermissionKind::Accessibility => permissions.accessibility != PermissionState::Ready,
             PermissionKind::SystemAudio => !system_audio,
+            PermissionKind::ScreenRecording => !crate::meeting::screen_recording_permitted(),
         });
         changed |= state.permissions_asked.len() != asked_len;
         changed |= update(&mut state.login_item_checking, self.login_checking);
@@ -798,6 +860,10 @@ impl NativeHost for MacHost {
             inputs.extend(practice.observations().into_iter().map(Input::Dictation));
         }
         inputs
+    }
+
+    fn practice_level(&self) -> f32 {
+        crate::dictation_indicator::recent_peak()
     }
 }
 
@@ -1238,12 +1304,107 @@ fn choose_folder() -> crate::file_dialog::Pending {
     crate::file_dialog::open(
         Dialog {
             title: tr("Transcript folder").into(),
-            accept: tr("Use Folder").into(),
             target: Target::Folder,
             directory: Some(crate::app_settings::meeting_output_folder()),
         },
         || crate::macos_rune::on_main_thread(|| {}),
     )
+}
+
+/// The Scrawl pane's OS work: Scrawl's own app and the captures folder.
+/// Its Screen Recording Allow opens the permission guide.
+#[cfg(hex_capture)]
+#[derive(Default)]
+struct ScrawlHost {
+    folder_choice: Option<crate::file_dialog::Pending>,
+    folder_error: Option<String>,
+}
+
+#[cfg(hex_capture)]
+impl ScrawlHost {
+    fn send(&mut self, request: super::platform::ScrawlRequest) {
+        use super::platform::ScrawlRequest;
+        match request {
+            // `send` moves the next refresh to now.
+            ScrawlRequest::Refresh => {}
+            ScrawlRequest::QuitScrawl => crate::capture_host::quit_scrawl(),
+            ScrawlRequest::RevealFolder => {
+                let folder = crate::app_settings::capture_settings().captures_dir();
+                match std::fs::create_dir_all(&folder) {
+                    Ok(()) => {
+                        crate::meeting::reveal(&folder);
+                        self.folder_error = None;
+                    }
+                    Err(error) => self.folder_error = Some(error.to_string()),
+                }
+            }
+            ScrawlRequest::ChooseFolder => {
+                if self.folder_choice.is_none() {
+                    use crate::file_dialog::{Dialog, Target};
+                    self.folder_choice = Some(crate::file_dialog::open(
+                        Dialog {
+                            title: tr("Captures folder").into(),
+                            target: Target::Folder,
+                            directory: Some(crate::app_settings::capture_settings().captures_dir()),
+                        },
+                        || crate::macos_rune::on_main_thread(|| {}),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The pane shows while the `capture` experiment is on; `refresh` also
+    /// rereads the permission and whether Scrawl runs.
+    fn poll(&mut self, state: &mut PlatformState, refresh: bool) -> bool {
+        if !crate::app_settings::capture_available() {
+            return state.scrawl.take().is_some();
+        }
+        let mut changed = state.scrawl.is_none();
+        let view = state.scrawl.get_or_insert_default();
+        if let Some(choice) = self.folder_choice.as_ref().and_then(|p| p.poll()) {
+            self.folder_choice = None;
+            match choice {
+                Ok(Some(folder)) => {
+                    self.folder_error = save_settings(|settings| {
+                        settings.capture.folder = Some(folder);
+                    })
+                    .err();
+                }
+                Ok(None) => {}
+                Err(error) => self.folder_error = Some(error),
+            }
+            changed = true;
+        }
+        changed |= update(&mut view.folder_error, self.folder_error.clone());
+        if !(refresh || changed) {
+            return changed;
+        }
+        let screen_recording = crate::meeting::screen_recording_permitted();
+        let running = crate::capture_host::scrawl_running();
+        changed |= update(&mut view.screen_recording, screen_recording);
+        changed |= update(&mut view.scrawl_running, running);
+        if !running {
+            changed |= update(&mut view.quitting_scrawl, false);
+        }
+        changed
+    }
+}
+
+/// Saves one change to the settings; the runtime publishes it to the
+/// window.
+#[cfg(hex_capture)]
+fn save_settings(change: impl FnOnce(&mut crate::app_settings::AppSettings)) -> Result<(), String> {
+    let mut settings =
+        crate::app_settings::AppSettings::load().map_err(|error| format!("{error:#}"))?;
+    change(&mut settings);
+    settings.save().map_err(|error| format!("{error:#}"))?;
+    if let Some(runtime) = crate::macos_rune::runtime() {
+        runtime
+            .send(Request::ReloadSettings)
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(())
 }
 
 /// Saves the chosen meetings folder; the runtime publishes it to the window.
@@ -1262,19 +1423,8 @@ fn save_meetings_folder(folder: PathBuf) -> Result<(), String> {
 
 /// Shows HUD Lab's tuning and demonstrated state on the dictation HUD.
 fn configure_hud(runtime: &RuntimeHandle, lab: HudLab) {
-    use crate::dictation_indicator::{DictationIndicatorEvent as Event, HudTuning};
-    let t = lab.tuning;
-    runtime.indicator(Event::Configure(HudTuning {
-        style: t.style,
-        line_count: t.line_count,
-        curvature: t.curvature,
-        speed: t.speed,
-        sharpness: t.sharpness,
-        glow: t.glow,
-        depth: t.depth,
-        light_angle: t.light_angle,
-        outline: t.outline,
-    }));
+    use crate::dictation_indicator::DictationIndicatorEvent as Event;
+    tune_hud(runtime, lab);
     runtime.indicator(Event::Reset);
     match lab.demo {
         HudDemo::Recording => {
@@ -1287,6 +1437,9 @@ fn configure_hud(runtime: &RuntimeHandle, lab: HudLab) {
                 average: 0.08,
                 peak: 0.42,
             });
+            if lab.dot_scope.is_some() {
+                runtime.indicator(Event::DemoVoice);
+            }
         }
         HudDemo::Transcribing | HudDemo::Processing => {
             runtime.indicator(Event::Submitted { job_id: 0 });
@@ -1300,6 +1453,26 @@ fn configure_hud(runtime: &RuntimeHandle, lab: HudLab) {
                 runtime.indicator(Event::Transcribing { job_id });
             }
         }
+    }
+}
+
+/// Applies HUD Lab's tuning to whatever the HUD shows.
+fn tune_hud(runtime: &RuntimeHandle, lab: HudLab) {
+    use crate::dictation_indicator::{DictationIndicatorEvent as Event, HudTuning};
+    let t = lab.tuning;
+    runtime.indicator(Event::Configure(HudTuning {
+        style: t.style,
+        line_count: t.line_count,
+        curvature: t.curvature,
+        speed: t.speed,
+        sharpness: t.sharpness,
+        glow: t.glow,
+        depth: t.depth,
+        light_angle: t.light_angle,
+        outline: t.outline,
+    }));
+    if let Some(tuning) = lab.dot_scope {
+        runtime.indicator(Event::ConfigureDotScope(tuning));
     }
 }
 
@@ -1410,6 +1583,24 @@ fn personal_catalog(status: &crate::personal_commands::StatusSnapshot) -> Vec<Ca
 mod tests {
     use super::*;
     use crate::app_settings::ModifierSide;
+
+    #[test]
+    fn paste_last_needs_a_key() {
+        let modifiers_only = HotkeyBinding {
+            modifiers: crate::app_settings::HotkeyModifiers::option_command(),
+            key: None,
+        };
+        assert_eq!(
+            validate_hotkey(ShortcutTarget::PasteLast, &modifiers_only),
+            Err(tr("Add a key"))
+        );
+        assert_eq!(
+            validate_hotkey(ShortcutTarget::Dictation, &modifiers_only),
+            Ok(())
+        );
+        let chord = HotkeyBinding::paste_last_default();
+        assert_eq!(validate_hotkey(ShortcutTarget::PasteLast, &chord), Ok(()));
+    }
 
     const LEFT_OPTION: u64 = 0x0008_0020;
     const RIGHT_OPTION: u64 = 0x0008_0040;
@@ -1538,6 +1729,7 @@ mod tests {
                 phase,
                 text: String::new(),
                 processing: None,
+                reason: None,
             })
             .unwrap()
                 + "\n"

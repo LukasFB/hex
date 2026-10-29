@@ -40,6 +40,7 @@ struct RunningListener {
     worker: JoinHandle<()>,
     /// Saved settings the listener applies in place.
     updates: mpsc::Sender<Box<AppSettings>>,
+    swap_failures: Receiver<crate::local_transcriber::SwapFailed>,
 }
 
 impl RunningListener {
@@ -68,7 +69,7 @@ pub(crate) struct WindowsDesktopHost {
     settings: AppSettings,
     history: Option<History>,
     last_dictation: Arc<Mutex<Option<String>>>,
-    indicator: crate::windows_rune_hud::WindowsIndicatorSender,
+    indicator: crate::rune_hud::HudSender,
     mode_runtime: Arc<RwLock<crate::dictation_modes::ModeRuntime>>,
     transformations: Arc<crate::personal_commands::TransformationClient>,
     personal_commands: Option<crate::personal_commands::PersonalCommands>,
@@ -151,7 +152,7 @@ impl WindowsDesktopHost {
         settings: AppSettings,
         settings_error: Option<String>,
         history: Option<History>,
-        indicator: crate::windows_rune_hud::WindowsIndicatorSender,
+        indicator: crate::rune_hud::HudSender,
     ) -> Self {
         crate::desktop_i18n::apply(settings.ui_language.as_deref());
         let mut event_reader = EventReader::open(&event_path);
@@ -187,6 +188,7 @@ impl WindowsDesktopHost {
             preparation: TranscriptionPreparation::default(),
             updater: crate::updater::Updater::start(),
         };
+        crate::transcription_models::delete_set_aside();
         host.refresh_personal_commands_host();
         host.adopt_default_voice_action_model();
         // The microphone stays cold until first-run setup finishes.
@@ -232,17 +234,13 @@ impl WindowsDesktopHost {
             DesktopAction::ClearError => self.error = None,
             DesktopAction::CheckForUpdates
             | DesktopAction::OpenUpdate
-            | DesktopAction::RestartIntoUpdate => match self.updater.act(&action) {
-                // Ends the app so the new version can take the named event.
-                Ok(quit) if quit => {
-                    self.stop();
-                    return true;
-                }
-                Ok(_) => {}
-                Err(error) => {
+            | DesktopAction::RestartIntoUpdate
+            | DesktopAction::ConfirmUpdateSwitch
+            | DesktopAction::WindowFocused => {
+                if let Err(error) = self.updater.act(&action) {
                     self.error = Some(tr_fill("Could not restart Hex: {}", &format!("{error:#}")));
                 }
-            },
+            }
             // Windows saves shortcuts from the window.
             DesktopAction::SetDictationShortcut(_) => {}
         }
@@ -283,9 +281,11 @@ impl WindowsDesktopHost {
         let worker_stop = stop.clone();
         let (result_sender, result_receiver) = mpsc::channel();
         let (updates, update_receiver) = mpsc::channel();
+        let (swap_failure_sender, swap_failures) = mpsc::channel();
         let event_path = self.event_path.clone();
         let selection = self.runtime_selection();
         let config = crate::windows_dictation::WindowsDictationConfig {
+            swap_failures: Some(swap_failure_sender),
             history: self.history.clone(),
             last_dictation: self.last_dictation.clone(),
             indicator: Some(self.indicator.clone()),
@@ -315,6 +315,7 @@ impl WindowsDesktopHost {
                     result: result_receiver,
                     worker,
                     updates,
+                    swap_failures,
                 });
                 self.session_before_start = self.activity.session_started_at;
                 self.awaiting_session_start = true;
@@ -352,6 +353,7 @@ impl WindowsDesktopHost {
         let current = settings;
         crate::feedback::set_enabled(current.sound_effects);
         crate::feedback::set_volume(current.sound_effect_volume.clamp(0.0, 1.0));
+        crate::feedback::set_theme(current.sound_theme);
         if previous.indicator_position != current.indicator_position {
             self.indicator.set_position(current.indicator_position);
         }
@@ -454,6 +456,23 @@ impl WindowsDesktopHost {
         selection
     }
 
+    /// The listener could not load a newly chosen model and still runs the
+    /// previous one. Settings go back to it, so they never name a model that
+    /// is not running and the picker never offers to delete the one in use.
+    fn keep_running_model(&mut self, failed: crate::local_transcriber::SwapFailed) {
+        // A choice made after the failed one stands.
+        if self.runtime_selection() != failed.wanted {
+            return;
+        }
+        let mut candidate = self.settings.clone();
+        candidate.remember_transcription(failed.kept);
+        match candidate.save() {
+            Ok(()) => self.apply_settings(&candidate),
+            Err(error) => tracing::warn!(%error, "could not restore the running model setting"),
+        }
+        self.preparation.set_error(Some(failed.error));
+    }
+
     /// Hosts the personal transformations workspace while any mode uses a
     /// transformation or the workspace exists.
     fn refresh_personal_commands_host(&mut self) {
@@ -472,6 +491,23 @@ impl WindowsDesktopHost {
         }
     }
 
+    /// True once Restart to update has handed off to the new version, after
+    /// the updater's final check; Hex then quits so it can take the named
+    /// event.
+    pub(crate) fn update_restarted(&mut self) -> bool {
+        match self.updater.take_restart() {
+            Some(Ok(())) => {
+                self.stop();
+                true
+            }
+            Some(Err(error)) => {
+                self.error = Some(tr_fill("Could not restart Hex: {}", &format!("{error:#}")));
+                false
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn refresh(&mut self) {
         if let Some(result) = self.preparation.poll() {
             let result = result.and_then(|selection| {
@@ -485,6 +521,14 @@ impl WindowsDesktopHost {
             if let Err(error) = result {
                 self.preparation.set_error(Some(error));
             }
+        }
+        let swap_failures = self
+            .listener
+            .as_ref()
+            .map(|listener| listener.swap_failures.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for failed in swap_failures {
+            self.keep_running_model(failed);
         }
         if self.listen_after_setup && crate::onboarding::completion_recorded() {
             self.listen_after_setup = false;

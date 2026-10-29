@@ -44,6 +44,9 @@ pub(crate) enum ShortcutTarget {
     Dictation,
     PasteLast,
     VoiceAction,
+    Capture,
+    /// The capsule's send-to list (`capture.list_hotkey`).
+    CaptureList,
 }
 
 struct PreparedTranscription {
@@ -322,6 +325,7 @@ pub(crate) fn run(
     *published.status.lock().unwrap() = Some(host.status(host.snapshot(), session.clone()));
     let (control, requests) = mpsc::sync_channel(8);
     server.serve(published.clone(), control.clone(), shutdown);
+    let tray = crate::linux_tray::start(control.clone(), shutdown);
     linux_service::notify("READY=1");
     tracing::info!(pid = std::process::id(), "Hex instance ready");
 
@@ -336,6 +340,7 @@ pub(crate) fn run(
     run_window(&host, requests, first, shutdown);
     shutdown.store(true, Ordering::Release);
     let _ = worker.join();
+    drop(tray);
     Ok(())
 }
 
@@ -477,6 +482,7 @@ impl LinuxDesktopHost {
     fn apply_output_settings(&mut self) {
         crate::feedback::set_enabled(self.settings.sound_effects);
         crate::feedback::set_volume(self.settings.sound_effect_volume.clamp(0.0, 1.0));
+        crate::feedback::set_theme(self.settings.sound_theme);
         *self
             .output
             .modes
@@ -581,6 +587,11 @@ impl LinuxDesktopHost {
     }
 
     fn refresh(&mut self) {
+        // Restart to update asks systemd to restart Hex after the updater's
+        // final check; only a failure needs showing.
+        if let Some(Err(error)) = self.updater.take_restart() {
+            self.error = Some(format!("Could not restart Hex: {error:#}"));
+        }
         // Settings may set up the transformations workspace at any time.
         if self.personal_commands_checked_at.elapsed() >= Duration::from_secs(2) {
             self.personal_commands_checked_at = Instant::now();
@@ -809,6 +820,8 @@ impl LinuxDesktopHost {
                         ShortcutTarget::Dictation => settings.dictation_hotkey = binding,
                         ShortcutTarget::PasteLast => settings.paste_last_hotkey = Some(binding),
                         ShortcutTarget::VoiceAction => settings.edit_hotkey = binding,
+                        ShortcutTarget::Capture => settings.capture.hotkey = binding,
+                        ShortcutTarget::CaptureList => settings.capture.list_hotkey = binding,
                     }
                 })
             }));
@@ -997,7 +1010,9 @@ impl LinuxDesktopHost {
             }
             DesktopAction::CheckForUpdates
             | DesktopAction::OpenUpdate
-            | DesktopAction::RestartIntoUpdate => {
+            | DesktopAction::RestartIntoUpdate
+            | DesktopAction::ConfirmUpdateSwitch
+            | DesktopAction::WindowFocused => {
                 if matches!(action, DesktopAction::RestartIntoUpdate)
                     && let Some(marker) = reopen_marker()
                 {

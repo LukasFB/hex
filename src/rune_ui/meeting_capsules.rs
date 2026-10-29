@@ -11,7 +11,8 @@
 //!
 //! The recording capsule's "Copy new" and "Copy all" copy the in-call
 //! transcript (Parakeet, `meeting::TranscriptReader`); "Copy new" shares
-//! Option-Control-V's cursor.
+//! Option-Control-V's cursor and first transcribes the call up to the click
+//! (`meeting::entries_for_copy`), saying "Transcribing…" meanwhile.
 //!
 //! The recording capsule rests as a compact pill in its corner and springs
 //! open to show its actions while the pointer is over it. Dragging it moves
@@ -23,13 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rune::{
-    Align, Cursor, Cx, Drag, El, OverlayHandle, OverlaySpec, Phase, ScreenEdge, Spring, Tx, col,
-    row, text,
+    Align, Anim, Cursor, Cx, Drag, El, OverlayHandle, OverlaySpec, Phase, ScreenEdge, Spring, Tx,
+    col, row, text,
 };
-#[allow(deprecated)]
-use rune_kit::{Badge, BadgeVariant, Button, ButtonSize, ButtonVariant};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant};
 
-use super::controls::{Paint, pulsing_dot, status_dot};
+use super::controls::{Paint, PushSize, pulsing_dot, status_dot};
 use crate::app_settings::{MeetingIndicatorCorner, MeetingPolicy, MeetingProviderChoice};
 use crate::calendar::CalendarMeeting;
 use crate::desktop_i18n::{tr, tr_fill};
@@ -112,6 +112,8 @@ struct Live {
     /// Speaker turns not yet copied or pasted.
     pending: usize,
     copied: Option<(LiveCopy, Instant)>,
+    /// Copy new is transcribing up to the click.
+    copying: bool,
 }
 
 impl Live {
@@ -139,9 +141,14 @@ struct Capsule {
     /// Moves the recording capsule's window by a drag's travel from `corner`.
     shift: Option<Shift>,
     save_corner: SaveCorner,
+    /// Reads a recording's transcript through now off the main thread, then
+    /// calls [`Capsule::finish_copy_new`]. Without it, Copy new copies what
+    /// the ticker last read.
+    copy_new: Option<CopyNew>,
 }
 
 type Choose = Arc<dyn Fn(MeetingProviderChoice) + Send + Sync>;
+type CopyNew = Arc<dyn Fn(String) + Send + Sync>;
 type Shift = Arc<dyn Fn(MeetingIndicatorCorner, f32, f32) + Send + Sync>;
 type SaveCorner = Arc<dyn Fn(MeetingIndicatorCorner) + Send + Sync>;
 
@@ -181,8 +188,62 @@ impl Capsule {
         }
     }
 
+    fn press_copy_new(&mut self, tx: &mut Tx) {
+        let Some(Kind::Recording { id, .. }) = &self.kind else {
+            return;
+        };
+        if self.live.copying {
+            return;
+        }
+        match self.copy_new.clone() {
+            Some(copy_new) => {
+                self.live.copying = true;
+                copy_new(id.clone());
+            }
+            None => {
+                let (id, entries) = (id.clone(), self.live.entries.clone());
+                self.copy_new_from(&id, &entries, tx);
+            }
+        }
+    }
+
+    /// Copies the new turns of `entries`, read through the click for the
+    /// recording `id`, if it still shows.
+    fn finish_copy_new(
+        &mut self,
+        id: &str,
+        entries: color_eyre::Result<Vec<TranscriptEntry>>,
+        tx: &mut Tx,
+    ) {
+        // A reply for an earlier recording leaves the shown one's copy alone.
+        if !matches!(&self.kind, Some(Kind::Recording { id: shown, .. }) if shown == id) {
+            return;
+        }
+        self.live.copying = false;
+        match entries {
+            Ok(entries) => self.copy_new_from(id, &entries, tx),
+            Err(error) => tracing::warn!(%error, "could not read new meeting transcript turns"),
+        }
+    }
+
+    fn copy_new_from(&mut self, id: &str, entries: &[TranscriptEntry], tx: &mut Tx) {
+        // Rune's clipboard write has no acknowledgment, so the cursor commits
+        // once it is queued (as GPUI's Copy new did).
+        match meeting::try_consume_delta_from(id, entries, |text| {
+            tx.copy(text.to_owned());
+            Ok(())
+        }) {
+            Ok(_) => {
+                self.live.pending = 0;
+                self.live.copied = Some((LiveCopy::New, Instant::now()));
+            }
+            Err(error) => tracing::warn!(%error, "could not copy new meeting transcript turns"),
+        }
+    }
+
     /// The recording pill follows the pointer and snaps to the nearest
-    /// corner on release.
+    /// corner on release. A cancelled drag (Escape, window blur) returns to
+    /// the corner it started from and saves nothing.
     fn drag(&mut self, drag: &Drag, tx: &mut Tx) {
         let Some(shift) = self.shift.clone() else {
             return;
@@ -190,6 +251,7 @@ impl Capsule {
         match drag.phase {
             Phase::Down => {}
             Phase::Move => shift(self.corner, drag.dx, drag.dy),
+            Phase::Up if drag.cancelled() => shift(self.corner, 0.0, 0.0),
             Phase::Up => {
                 let corner = primary_screen_size().map_or(self.corner, |screen| {
                     nearest_corner(self.corner, drag.dx, drag.dy, screen)
@@ -323,10 +385,22 @@ impl MeetingCapsules {
                     corner: MeetingIndicatorCorner::default(),
                     shift: None,
                     save_corner: save_corner.clone(),
+                    copy_new: None,
                 },
             );
             let (hide, resize, shift) = (handle.clone(), handle.clone(), handle.clone());
+            let copied = handle.clone();
+            let copy_new: CopyNew = Arc::new(move |id: String| {
+                let copied = copied.clone();
+                // The wait for the transcript through the click stays off
+                // the main thread.
+                std::thread::spawn(move || {
+                    let entries = meeting::entries_for_copy(&id);
+                    copied.update(move |capsule, tx| capsule.finish_copy_new(&id, entries, tx));
+                });
+            });
             handle.update(move |capsule, _| {
+                capsule.copy_new = Some(copy_new);
                 capsule.hide = Some(Arc::new(move || hide.hide()));
                 capsule.resize = Some(Arc::new(move |width| {
                     resize.resize((width, MEETING_PANEL_HEIGHT));
@@ -565,7 +639,6 @@ impl MeetingCapsules {
     }
 }
 
-#[allow(deprecated)]
 fn button(
     p: Paint,
     key: &str,
@@ -579,13 +652,16 @@ fn button(
         } else {
             ButtonVariant::Neutral
         })
-        .size(ButtonSize::Normal)
         .on_press(press)
-        .build(p.k)
+        .build_push(p.k)
         .key(key)
 }
 
 fn view(capsule: &Capsule, cx: &mut Cx<Capsule>) -> El {
+    view_body(capsule, cx).hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+}
+
+fn view_body(capsule: &Capsule, cx: &mut Cx<Capsule>) -> El {
     let p = Paint::new(cx.system_dark(), cx.env().scale);
     let Some(kind) = &capsule.kind else {
         return row().key("empty");
@@ -802,7 +878,6 @@ fn offer_choices(p: Paint, candidate: &MeetingCandidate) -> (rune::Color, String
     )
 }
 
-#[allow(deprecated)]
 fn ready(
     p: Paint,
     manifest: &MeetingManifest,
@@ -834,7 +909,6 @@ fn ready(
     };
     let copy = Button::new(tr(if copied { "Copied" } else { "Copy" }))
         .variant(ButtonVariant::Neutral)
-        .size(ButtonSize::Normal)
         .on_press_tx(|c: &mut Capsule, tx: &mut Tx| {
             let Some(Kind::Ready(manifest)) = &c.kind else {
                 return;
@@ -847,7 +921,7 @@ fn ready(
                 Err(error) => tracing::warn!(%error, "could not copy meeting transcript"),
             }
         })
-        .build(p.k)
+        .build_push(p.k)
         .key("copy-transcript");
     let mut actions = vec![copy];
     if manifest.export_path.is_some() {
@@ -863,7 +937,6 @@ fn ready(
     (p.success(), title, subtitle, actions)
 }
 
-#[allow(deprecated)]
 fn recording(p: Paint, capsule: &Capsule, title: &str, started: Instant, automatic: bool) -> El {
     let live = &capsule.live;
     let elapsed = meeting::format_duration(started.elapsed().as_millis() as u64);
@@ -873,7 +946,9 @@ fn recording(p: Paint, capsule: &Capsule, title: &str, started: Instant, automat
         elapsed
     };
     let copied_new = live.copied(LiveCopy::New);
-    let copy_new = Button::new(if copied_new {
+    let copy_new = Button::new(if live.copying {
+        tr("Transcribing…").to_owned()
+    } else if copied_new {
         tr("Copied").to_owned()
     } else if live.pending > 0 {
         tr_fill("Copy new ({})", &live.pending.to_string())
@@ -881,32 +956,15 @@ fn recording(p: Paint, capsule: &Capsule, title: &str, started: Instant, automat
         tr("Copy new").to_owned()
     })
     .variant(ButtonVariant::Neutral)
-    .size(ButtonSize::Normal)
-    .disabled(live.pending == 0 && !copied_new)
-    .on_press_tx(|c: &mut Capsule, tx: &mut Tx| {
-        let Some(Kind::Recording { id, .. }) = &c.kind else {
-            return;
-        };
-        // Rune's clipboard write has no acknowledgment, so the cursor commits
-        // once it is queued (as GPUI's Copy new did).
-        match meeting::try_consume_delta_from(id, &c.live.entries, |text| {
-            tx.copy(text.to_owned());
-            Ok(())
-        }) {
-            Ok(_) => {
-                c.live.pending = 0;
-                c.live.copied = Some((LiveCopy::New, Instant::now()));
-            }
-            Err(error) => tracing::warn!(%error, "could not copy new meeting transcript turns"),
-        }
-    })
-    .build(p.k)
+    // Reading through the click can find speech the ticker hasn't shown.
+    .disabled(live.copying || (live.pending == 0 && !copied_new && capsule.copy_new.is_none()))
+    .on_press_tx(|c: &mut Capsule, tx: &mut Tx| c.press_copy_new(tx))
+    .build_push(p.k)
     .min_w(COPY_NEW_WIDTH)
     .key("copy-new");
     let copied_all = live.copied(LiveCopy::All);
     let copy_all = Button::new(tr(if copied_all { "Copied" } else { "Copy all" }))
         .variant(ButtonVariant::Neutral)
-        .size(ButtonSize::Normal)
         .disabled(live.entries.is_empty() && !copied_all)
         .on_press_tx(|c: &mut Capsule, tx: &mut Tx| {
             if c.live.entries.is_empty() {
@@ -915,7 +973,7 @@ fn recording(p: Paint, capsule: &Capsule, title: &str, started: Instant, automat
             tx.copy(meeting::transcript_markdown(&c.live.entries));
             c.live.copied = Some((LiveCopy::All, Instant::now()));
         })
-        .build(p.k)
+        .build_push(p.k)
         .key("copy-all");
     let actions = vec![
         copy_new,
@@ -1108,6 +1166,7 @@ mod tests {
             corner: MeetingIndicatorCorner::TopRight,
             shift: None,
             save_corner: Arc::new(|_| {}),
+            copy_new: None,
         };
         let env = Env {
             system_dark: dark,
@@ -1335,6 +1394,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copy_new_copies_the_transcript_read_through_the_click() {
+        let id = "capsule-copy-through-click";
+        let (mut rt, _, _) = runtime(live_recording(id), false, true, RECORDING);
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        open_recording(&mut rt);
+        rt.update(move |capsule, _| {
+            capsule.copy_new = Some(Arc::new(move |id| record.lock().unwrap().push(id)));
+        });
+        rt.frame(1.0 / 60.0);
+        // The ticker has shown nothing yet, but the call may hold speech.
+        tap(&mut rt, "copy-new");
+        assert_eq!(*asked.lock().unwrap(), [id]);
+        assert!(texts(&rt).contains(&"Transcribing…".to_string()));
+        assert!(rt.copy_request.is_none());
+        tap(&mut rt, "copy-new");
+        assert_eq!(asked.lock().unwrap().len(), 1, "one copy at a time");
+
+        rt.update(move |capsule, tx| capsule.finish_copy_new(id, Ok(call()), tx));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            rt.copy_request.take().as_deref(),
+            Some(
+                "Them: Kickoff is at two thirty.\n\nYou: Two thirty works.\n\nThem: Then let's ship it."
+            )
+        );
+        assert!(texts(&rt).contains(&"Copied".to_string()));
+        assert_eq!(meeting::pending_delta_turns(id, &call()), 0);
+
+        // A copy still running when the next recording shows: its late reply
+        // neither copies nor ends the new recording's copy.
+        let next = "capsule-copy-through-click-next";
+        tap(&mut rt, "copy-new");
+        rt.update(move |capsule, _| {
+            capsule.kind = Some(live_recording(next));
+            capsule.live = Live::default();
+        });
+        rt.frame(1.0 / 60.0);
+        tap(&mut rt, "copy-new");
+        assert_eq!(*asked.lock().unwrap(), [id, id, next]);
+        rt.update(move |capsule, tx| capsule.finish_copy_new(id, Ok(call()), tx));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.copy_request.is_none());
+        assert!(rt.state.live.copying);
+        assert!(texts(&rt).contains(&"Transcribing…".to_string()));
+        rt.update(move |capsule, tx| capsule.finish_copy_new(next, Ok(call()), tx));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.copy_request.take().is_some());
+        assert!(!rt.state.live.copying);
+    }
+
     fn open_recording(rt: &mut Runtime<Capsule>) {
         let (x, y) = rt.find("pill").unwrap();
         rt.pointer_move(x, y);
@@ -1398,6 +1509,36 @@ mod tests {
         rt.frame(0.0);
         // Off the main thread there is no screen to snap against, so it
         // returns to its corner.
+        assert_eq!(
+            moves.lock().unwrap().last(),
+            Some(&(MeetingIndicatorCorner::TopRight, 0.0, 0.0))
+        );
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_capsule_drag_returns_to_its_corner_without_saving() {
+        type Moves = Arc<Mutex<Vec<(MeetingIndicatorCorner, f32, f32)>>>;
+        let (mut rt, _, _) = runtime(live_recording("capsule-cancel"), false, true, RECORDING);
+        let (moves, saved): (Moves, Arc<Mutex<Vec<MeetingIndicatorCorner>>>) = Default::default();
+        let (record, save) = (moves.clone(), saved.clone());
+        rt.update(move |capsule, _| {
+            capsule.shift = Some(Arc::new(move |corner, dx, dy| {
+                record.lock().unwrap().push((corner, dx, dy));
+            }));
+            capsule.save_corner = Arc::new(move |corner| save.lock().unwrap().push(corner));
+        });
+        rt.frame(0.0);
+        let (x, y) = rt.find("pill").unwrap();
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_move(x - 400.0, y + 300.0);
+        rt.frame(0.0);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: rune::Mods::default(),
+        });
+        rt.frame(0.0);
         assert_eq!(
             moves.lock().unwrap().last(),
             Some(&(MeetingIndicatorCorner::TopRight, 0.0, 0.0))
@@ -1508,6 +1649,18 @@ mod tests {
                     false,
                     RECORDING,
                     |capsule: &mut Capsule| capsule.corner = MeetingIndicatorCorner::BottomLeft,
+                ),
+                (
+                    "recording-transcribing",
+                    live_recording("snap"),
+                    false,
+                    RECORDING,
+                    |capsule: &mut Capsule| {
+                        capsule.live.entries = call();
+                        capsule.live.pending = 3;
+                        capsule.live.copying = true;
+                        capsule.hovered = true;
+                    },
                 ),
                 (
                     "recording-copied",

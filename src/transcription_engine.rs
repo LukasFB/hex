@@ -7,8 +7,9 @@
 //! that cannot stream always takes the offline path. Commands are handled in
 //! order on one thread, because a live stream holds the model's compute lease.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -93,6 +94,32 @@ pub(crate) enum Command {
         offline: Offline,
         job: Job,
     },
+    /// An offline run that waits for an open live stream to end instead of
+    /// interrupting it, such as a capture's word chunk or a `/streams`
+    /// window. Like a finish it is a dictation request, so background work
+    /// sent before it yields.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Foreground {
+        clip: Vec<f32>,
+        offline: Offline,
+        job: Job,
+    },
+    /// A live stream that gives way to dictation (`/streams`): any dictation
+    /// request closes it, and while a dictation stream is open it is refused
+    /// instead of interrupting it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BeginYielding {
+        stream: u64,
+        cancel: CancelToken,
+        yielding: Yielding,
+    },
+    /// Finalizes a yielding stream, or answers [`PREEMPTED`] at once when it
+    /// is no longer open. It never runs anything offline.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    FinishYielding {
+        stream: u64,
+        reply: SyncSender<Result<String, String>>,
+    },
     /// Work that needs the model itself, such as loading or switching it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Run(Box<dyn FnOnce(&mut Model) + Send>),
@@ -103,6 +130,139 @@ pub(crate) enum Command {
         work: Background,
     },
     Shutdown,
+}
+
+/// Why a yielding stream ended without its text: dictation needed the engine.
+pub(crate) const PREEMPTED: &str = "the stream gave way to dictation";
+
+/// A live stream's text so far, as the model reports it after each feed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Partial {
+    /// The prefix the model has committed; it only grows within one stream.
+    pub stable: String,
+    /// The model's volatile hypothesis after `stable`.
+    pub tentative: String,
+}
+
+/// What the worker shares with a yielding stream's owner: whether the stream
+/// is still open on the engine, and its latest partial text.
+#[derive(Clone)]
+pub(crate) struct Yielding {
+    open: Arc<AtomicBool>,
+    /// Samples the model has consumed.
+    consumed: Arc<AtomicUsize>,
+    partial: Arc<Mutex<Option<Partial>>>,
+}
+
+impl Yielding {
+    fn new() -> Self {
+        Self {
+            open: Arc::new(AtomicBool::new(true)),
+            consumed: Arc::default(),
+            partial: Arc::default(),
+        }
+    }
+
+    fn close(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    fn publish(&self, partial: Partial) {
+        let mut slot = self
+            .partial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.as_ref() != Some(&partial) {
+            *slot = Some(partial);
+        }
+    }
+}
+
+/// A live stream that gives way to dictation (`/streams`). Unlike a
+/// [`LiveStream`] it is not a dictation request: background work sent before
+/// it still runs, and any dictation request closes it. Feed it 16 kHz audio,
+/// then [`Self::finish`] it or drop it to cancel.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct YieldingStream {
+    id: u64,
+    cancel: CancelToken,
+    yielding: Yielding,
+    sent: usize,
+    finished: bool,
+    commands: Sender<Command>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl YieldingStream {
+    /// Whether the stream is still open on the engine. Once dictation closes
+    /// it, its audio must be transcribed some other way.
+    pub(crate) fn open(&self) -> bool {
+        self.yielding.open.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn feed(&mut self, samples: &[f32]) {
+        if samples.is_empty() || !self.open() {
+            return;
+        }
+        self.sent += samples.len();
+        let _ = self.commands.send(Command::Feed {
+            stream: self.id,
+            samples: samples.to_vec(),
+        });
+    }
+
+    /// Samples sent that the model has not consumed yet. Keeping this small
+    /// keeps a dictation request from queueing behind a pile of feeds.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.sent
+            .saturating_sub(self.yielding.consumed.load(Ordering::Acquire))
+    }
+
+    /// The model's latest text for the audio fed so far.
+    pub(crate) fn partial(&self) -> Option<Partial> {
+        self.yielding
+            .partial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Finalizes the stream within `deadline`. It fails with [`PREEMPTED`]
+    /// when dictation closed it first, and is aborted when the engine does
+    /// not reach it in time; either way nothing was lost but this text.
+    pub(crate) fn finish(mut self, deadline: Duration) -> Result<String, String> {
+        self.finished = true;
+        if !self.open() {
+            return Err(PREEMPTED.into());
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        if self
+            .commands
+            .send(Command::FinishYielding {
+                stream: self.id,
+                reply,
+            })
+            .is_err()
+        {
+            return Err("transcription engine stopped".into());
+        }
+        match receiver.recv_timeout(deadline) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancel.cancel();
+                Err("the stream missed its finish deadline".into())
+            }
+            Err(RecvTimeoutError::Disconnected) => Err("transcription engine stopped".into()),
+        }
+    }
+}
+
+impl Drop for YieldingStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.commands.send(Command::Cancel { stream: self.id });
+        }
+    }
 }
 
 /// One finish request as the worker sees it: its own cancellation, so a
@@ -405,6 +565,39 @@ impl TranscriptionEngine {
         })
     }
 
+    /// Opens a stream that gives way to dictation, when the loaded model can
+    /// stream on this device. See [`YieldingStream`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn begin_yielding(&self) -> Option<YieldingStream> {
+        if !self.streams.load(Ordering::Acquire) {
+            return None;
+        }
+        let id = self.next_stream.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancel = CancelToken::new();
+        let yielding = Yielding::new();
+        self.commands
+            .send(Command::BeginYielding {
+                stream: id,
+                cancel: cancel.clone(),
+                yielding: yielding.clone(),
+            })
+            .ok()?;
+        Some(YieldingStream {
+            id,
+            cancel,
+            yielding,
+            sent: 0,
+            finished: false,
+            commands: self.commands.clone(),
+        })
+    }
+
+    /// Whether the loaded model can stream on its device.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn streams(&self) -> bool {
+        self.streams.load(Ordering::Acquire)
+    }
+
     /// Finishes a capture with its complete 16 kHz clip. Without a stream,
     /// or when the stream is unusable, the clip is transcribed offline.
     #[cfg(not(target_os = "macos"))]
@@ -428,10 +621,6 @@ impl TranscriptionEngine {
         clip: Vec<f32>,
         offline: Offline,
     ) -> Result<PendingTranscript> {
-        let (reply, receiver) = mpsc::channel();
-        let cancel = CancelToken::new();
-        let job = self.deadlines.job_for(clip.len());
-        self.requests.fetch_add(1, Ordering::AcqRel);
         let (stream, stream_cancel) = match stream {
             Some(mut stream) => {
                 stream.finished = true;
@@ -439,16 +628,41 @@ impl TranscriptionEngine {
             }
             None => (None, None),
         };
+        self.request(clip.len(), stream_cancel, |job| Command::Finish {
+            stream,
+            clip,
+            offline,
+            job,
+        })
+    }
+
+    /// Transcribes `clip` offline after every command already sent, without
+    /// ever interrupting a live stream: one open when it arrives finishes
+    /// first. Background work sent before it yields, as to a finish.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn foreground(&self, clip: Vec<f32>, offline: Offline) -> Result<PendingTranscript> {
+        self.request(clip.len(), None, |job| Command::Foreground {
+            clip,
+            offline,
+            job,
+        })
+    }
+
+    fn request(
+        &self,
+        samples: usize,
+        stream_cancel: Option<CancelToken>,
+        command: impl FnOnce(Job) -> Command,
+    ) -> Result<PendingTranscript> {
+        let (reply, receiver) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let job = self.deadlines.job_for(samples);
+        self.requests.fetch_add(1, Ordering::AcqRel);
         self.commands
-            .send(Command::Finish {
-                stream,
-                clip,
-                offline,
-                job: Job {
-                    cancel: cancel.clone(),
-                    reply,
-                },
-            })
+            .send(command(Job {
+                cancel: cancel.clone(),
+                reply,
+            }))
             .map_err(|_| eyre!("transcription engine stopped"))?;
         Ok(PendingTranscript {
             reply: receiver,
@@ -535,6 +749,19 @@ impl TranscriptionEngine {
 }
 
 #[cfg(target_os = "macos")]
+impl TranscriptionEngine {
+    /// The GGUF selection the model held after its last finished command.
+    pub(crate) fn held_selection(
+        &self,
+    ) -> Option<crate::transcription_models::TranscriptionSelection> {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(target_os = "macos")]
 static SHARED: std::sync::Mutex<std::sync::Weak<TranscriptionEngine>> =
     std::sync::Mutex::new(std::sync::Weak::new());
 
@@ -586,14 +813,29 @@ enum StreamEnd {
 
 impl Worker {
     fn run(mut self, commands: Receiver<Command>) {
-        let mut next = None;
+        // Commands received while a stream was open, handled before new ones.
+        let mut next = VecDeque::new();
         loop {
-            let Some(command) = next.take().or_else(|| commands.recv().ok()) else {
+            let Some(command) = next.pop_front().or_else(|| commands.recv().ok()) else {
                 return;
             };
             match command {
                 Command::Begin { stream, cancel } => {
-                    next = self.stream(stream, &cancel, &commands);
+                    self.stream(stream, &cancel, &commands, &mut next);
+                }
+                Command::BeginYielding {
+                    stream,
+                    cancel,
+                    yielding,
+                } => {
+                    // Anything already waiting comes first.
+                    if next.is_empty() {
+                        self.yielding_stream(stream, &cancel, &yielding, &commands, &mut next);
+                    }
+                    yielding.close();
+                }
+                Command::FinishYielding { reply, .. } => {
+                    let _ = reply.send(Err(PREEMPTED.into()));
                 }
                 Command::Finish {
                     stream,
@@ -601,20 +843,16 @@ impl Worker {
                     offline,
                     job,
                 } => {
-                    if job.cancel.is_cancelled() {
-                        // Its waiter already gave up on it.
-                        job.finish(Err("transcription was abandoned".into()));
-                        continue;
-                    }
-                    let started = Instant::now();
-                    self.start(&job);
                     let source = match stream {
                         // The stream was already closed: its begin failed or
                         // another command interrupted it.
                         Some(_) => Source::Fallback("the live stream was not available".into()),
                         None => Source::Offline,
                     };
-                    self.offline(clip, offline, source, started, job);
+                    self.run_offline(clip, offline, source, job);
+                }
+                Command::Foreground { clip, offline, job } => {
+                    self.run_offline(clip, offline, Source::Offline, job);
                 }
                 Command::Run(work) => {
                     work(&mut self.model);
@@ -645,6 +883,17 @@ impl Worker {
         }
     }
 
+    fn run_offline(&mut self, clip: Vec<f32>, offline: Offline, source: Source, job: Job) {
+        if job.cancel.is_cancelled() {
+            // Its waiter already gave up on it.
+            job.finish(Err("transcription was abandoned".into()));
+            return;
+        }
+        let started = Instant::now();
+        self.start(&job);
+        self.offline(clip, offline, source, started, job);
+    }
+
     /// Starts a job's clock. The engine is evidently moving again.
     fn start(&self, job: &Job) {
         self.stalled.store(false, Ordering::Release);
@@ -652,68 +901,26 @@ impl Worker {
     }
 
     /// Drives one live stream until it finishes, is cancelled, or another
-    /// command interrupts it. Returns a command still to be handled.
+    /// command interrupts it. Commands still to be handled, in order, are
+    /// pushed onto `next`.
     fn stream(
         &mut self,
         id: u64,
         cancel: &CancelToken,
         commands: &Receiver<Command>,
-    ) -> Option<Command> {
-        let options = self.model.stream_options().cloned()?;
+        next: &mut VecDeque<Command>,
+    ) {
+        let Some(options) = self.model.stream_options().cloned() else {
+            return;
+        };
         self.running.enter(cancel);
         let begun = Instant::now();
-        let mut feed_ms = 0_u128;
-        let mut feeds = 0_u32;
+        let mut stats = FeedStats::default();
         let stalled = &self.stalled;
         let ended = self.model.with_stream(&options, cancel, |stream| {
-            let mut failure: Option<String> = None;
-            let mut fed = 0_usize;
-            loop {
-                let Ok(command) = commands.recv() else {
-                    return StreamEnd::Disconnected;
-                };
-                match command {
-                    Command::Feed { stream: s, samples } if s == id => {
-                        fed += samples.len();
-                        if failure.is_none() {
-                            let started = Instant::now();
-                            if let Err(error) = stream.feed(&samples) {
-                                failure = Some(format!("stream feed failed: {error}"));
-                            }
-                            feed_ms += started.elapsed().as_millis();
-                            feeds += 1;
-                        }
-                    }
-                    Command::Feed { .. } => {}
-                    // Background work never interrupts a capture.
-                    Command::Background { work, .. } => work(None),
-                    Command::Cancel { stream: s } if s == id => return StreamEnd::Cancelled,
-                    Command::Cancel { .. } => {}
-                    Command::Finish {
-                        stream: Some(s),
-                        clip,
-                        offline,
-                        job,
-                    } if s == id => {
-                        let started = Instant::now();
-                        stalled.store(false, Ordering::Release);
-                        job.start();
-                        let result = match failure {
-                            Some(failure) => Err(failure),
-                            None => finish_stream(stream, &clip, fed),
-                        };
-                        return StreamEnd::Finished {
-                            result,
-                            clip,
-                            offline,
-                            job,
-                            started,
-                        };
-                    }
-                    other => return StreamEnd::Interrupted(other),
-                }
-            }
+            drive_stream(id, stream, commands, stalled, next, &mut stats)
         });
+        let FeedStats { feed_ms, feeds } = stats;
         match ended {
             Ok(StreamEnd::Finished {
                 result,
@@ -744,14 +951,38 @@ impl Worker {
                         self.offline(clip, offline, Source::Fallback(reason), started, job);
                     }
                 }
-                None
             }
-            Ok(StreamEnd::Cancelled) | Ok(StreamEnd::Disconnected) => None,
-            Ok(StreamEnd::Interrupted(command)) => Some(command),
-            Err(error) => {
-                tracing::warn!(%error, "could not begin a live stream");
-                None
-            }
+            Ok(StreamEnd::Cancelled) | Ok(StreamEnd::Disconnected) => {}
+            Ok(StreamEnd::Interrupted(command)) => next.push_back(command),
+            Err(error) => tracing::warn!(%error, "could not begin a live stream"),
+        }
+    }
+
+    /// Drives one yielding stream until it finishes, is cancelled, or any
+    /// command that is not its own, background, or foreground work arrives;
+    /// that command is handled next.
+    fn yielding_stream(
+        &mut self,
+        id: u64,
+        cancel: &CancelToken,
+        yielding: &Yielding,
+        commands: &Receiver<Command>,
+        next: &mut VecDeque<Command>,
+    ) {
+        let Some(options) = self.model.stream_options().cloned() else {
+            return;
+        };
+        if cancel.is_cancelled() {
+            return;
+        }
+        self.running.enter(cancel);
+        let ended = self.model.with_stream(&options, cancel, |stream| {
+            drive_yielding(id, stream, commands, yielding, next)
+        });
+        match ended {
+            Ok(Some(command)) => next.push_back(command),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not begin a yielding stream"),
         }
     }
 
@@ -781,11 +1012,155 @@ impl Worker {
 /// Feeds whatever part of the clip the stream has not seen, then finalizes.
 /// The clip is authoritative: a stream fed well past its trimmed end, or one
 /// that produced nothing, is reported unusable so the caller falls back.
-fn finish_stream(
-    stream: &mut transcribe_cpp::Stream<'_>,
-    clip: &[f32],
-    fed: usize,
-) -> Result<String, String> {
+/// The live stream as the worker drives it.
+trait StreamFeed {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), String>;
+    fn finalize(&mut self) -> Result<String, String>;
+    fn partial(&self) -> Partial;
+}
+
+impl StreamFeed for transcribe_cpp::Stream<'_> {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), String> {
+        transcribe_cpp::Stream::feed(self, samples)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
+    fn finalize(&mut self) -> Result<String, String> {
+        transcribe_cpp::Stream::finalize(self).map_err(|error| error.to_string())?;
+        Ok(self.text().full.trim().to_string())
+    }
+
+    fn partial(&self) -> Partial {
+        let text = self.text();
+        Partial {
+            stable: text.committed.trim_start().to_string(),
+            tentative: text.tentative,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FeedStats {
+    feed_ms: u128,
+    feeds: u32,
+}
+
+/// Handles commands while stream `id` is open. Foreground work waits in
+/// `deferred` until the stream ends; background work is skipped; any other
+/// command interrupts the stream.
+fn drive_stream(
+    id: u64,
+    stream: &mut impl StreamFeed,
+    commands: &Receiver<Command>,
+    stalled: &AtomicBool,
+    deferred: &mut VecDeque<Command>,
+    stats: &mut FeedStats,
+) -> StreamEnd {
+    let mut failure: Option<String> = None;
+    let mut fed = 0_usize;
+    loop {
+        let Ok(command) = commands.recv() else {
+            return StreamEnd::Disconnected;
+        };
+        match command {
+            Command::Feed { stream: s, samples } if s == id => {
+                fed += samples.len();
+                if failure.is_none() {
+                    let started = Instant::now();
+                    if let Err(error) = stream.feed(&samples) {
+                        failure = Some(format!("stream feed failed: {error}"));
+                    }
+                    stats.feed_ms += started.elapsed().as_millis();
+                    stats.feeds += 1;
+                }
+            }
+            Command::Feed { .. } => {}
+            // Background work never interrupts a capture.
+            Command::Background { work, .. } => work(None),
+            // Nor does foreground work; it runs once the stream ends.
+            foreground @ Command::Foreground { .. } => deferred.push_back(foreground),
+            // Nor does a stream that gives way to dictation; it is refused.
+            Command::BeginYielding { yielding, .. } => yielding.close(),
+            Command::FinishYielding { reply, .. } => {
+                let _ = reply.send(Err(PREEMPTED.into()));
+            }
+            Command::Cancel { stream: s } if s == id => return StreamEnd::Cancelled,
+            Command::Cancel { .. } => {}
+            Command::Finish {
+                stream: Some(s),
+                clip,
+                offline,
+                job,
+            } if s == id => {
+                let started = Instant::now();
+                stalled.store(false, Ordering::Release);
+                job.start();
+                let result = match failure {
+                    Some(failure) => Err(failure),
+                    None => finish_stream(stream, &clip, fed),
+                };
+                return StreamEnd::Finished {
+                    result,
+                    clip,
+                    offline,
+                    job,
+                    started,
+                };
+            }
+            other => return StreamEnd::Interrupted(other),
+        }
+    }
+}
+
+/// Handles commands while yielding stream `id` is open, publishing its
+/// partial text after each feed. Background work is skipped and foreground
+/// work deferred, as in a dictation stream; any other command (a dictation
+/// begin or finish, model work, shutdown) closes it and is returned.
+fn drive_yielding(
+    id: u64,
+    stream: &mut impl StreamFeed,
+    commands: &Receiver<Command>,
+    yielding: &Yielding,
+    deferred: &mut VecDeque<Command>,
+) -> Option<Command> {
+    loop {
+        let Ok(command) = commands.recv() else {
+            return None;
+        };
+        match command {
+            Command::Feed { stream: s, samples } if s == id => match stream.feed(&samples) {
+                Ok(()) => {
+                    yielding.consumed.fetch_add(samples.len(), Ordering::AcqRel);
+                    yielding.publish(stream.partial());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "yielding stream feed failed");
+                    return None;
+                }
+            },
+            Command::Feed { .. } => {}
+            Command::Background { work, .. } => work(None),
+            foreground @ Command::Foreground { .. } => deferred.push_back(foreground),
+            Command::Cancel { stream: s } if s == id => return None,
+            Command::Cancel { .. } => {}
+            Command::FinishYielding { stream: s, reply } if s == id => {
+                let _ = reply.send(stream.finalize());
+                return None;
+            }
+            Command::FinishYielding { reply, .. } => {
+                let _ = reply.send(Err(PREEMPTED.into()));
+            }
+            Command::BeginYielding { yielding, .. } => yielding.close(),
+            other => {
+                yielding.close();
+                return Some(other);
+            }
+        }
+    }
+}
+
+fn finish_stream(stream: &mut impl StreamFeed, clip: &[f32], fed: usize) -> Result<String, String> {
     if fed > clip.len() + MAX_OVERFED_SAMPLES {
         return Err(format!(
             "the stream received {} ms past the clip's end",
@@ -797,10 +1172,9 @@ fn finish_stream(
             .feed(&clip[fed..])
             .map_err(|error| format!("stream feed failed: {error}"))?;
     }
-    stream
+    let text = stream
         .finalize()
         .map_err(|error| format!("stream finalize failed: {error}"))?;
-    let text = stream.text().full.trim().to_string();
     if text.is_empty() {
         return Err("the stream returned no text".into());
     }
@@ -848,6 +1222,187 @@ mod tests {
                 Command::Finish { stream: Some(2), clip, .. },
             ] if first.len() == 3 && second.len() == 2 && clip.len() == 7
         ));
+    }
+
+    #[derive(Default)]
+    struct FakeStream {
+        fed: Vec<f32>,
+    }
+
+    impl StreamFeed for FakeStream {
+        fn feed(&mut self, samples: &[f32]) -> Result<(), String> {
+            self.fed.extend_from_slice(samples);
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<String, String> {
+            Ok(format!("streamed {}", self.fed.len()))
+        }
+
+        fn partial(&self) -> Partial {
+            Partial {
+                stable: format!("heard {}", self.fed.len()),
+                tentative: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_work_waits_for_an_open_stream_instead_of_interrupting_it() {
+        let (engine, commands) = TranscriptionEngine::for_test();
+        let mut stream = engine.begin().unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Begin { stream: 1, .. }
+        ));
+        stream.feed(&[0.1; 4]);
+        let chunk = engine
+            .foreground(vec![0.0; 9], Box::new(|_, _| Ok("chunk".into())))
+            .unwrap();
+        stream.feed(&[0.2; 4]);
+        let dictation = engine
+            .finish_with(
+                Some(stream),
+                vec![0.0; 8],
+                Box::new(|_, _| panic!("the dictation must not be retranscribed offline")),
+            )
+            .unwrap();
+
+        let mut fake = FakeStream::default();
+        let mut deferred = VecDeque::new();
+        let ended = drive_stream(
+            1,
+            &mut fake,
+            &commands,
+            &AtomicBool::new(false),
+            &mut deferred,
+            &mut FeedStats::default(),
+        );
+        let StreamEnd::Finished { result, job, .. } = ended else {
+            panic!("the stream did not finish");
+        };
+        // The stream got all its audio and finished as a stream.
+        assert_eq!(result, Ok("streamed 8".to_string()));
+        assert_eq!(fake.fed.len(), 8);
+        job.finish(Ok(Transcribed {
+            text: "streamed 8".into(),
+            source: Source::Stream,
+            finish_ms: 0,
+        }));
+        assert_eq!(dictation.wait().unwrap().source, Source::Stream);
+        // The chunk waits to run after the stream.
+        assert!(matches!(
+            deferred.as_slices().0,
+            [Command::Foreground { clip, .. }] if clip.len() == 9
+        ));
+        drop(deferred);
+        assert!(chunk.wait().is_err());
+    }
+
+    fn begun_yielding(commands: &Receiver<Command>) -> Yielding {
+        match commands.try_recv() {
+            Ok(Command::BeginYielding { yielding, .. }) => yielding,
+            _ => panic!("a yielding stream began"),
+        }
+    }
+
+    #[test]
+    fn a_yielding_stream_reports_partials_and_finishes_through_the_stream() {
+        let (engine, commands) = TranscriptionEngine::for_test();
+        let mut stream = engine.begin_yielding().unwrap();
+        let yielding = begun_yielding(&commands);
+        stream.feed(&[0.1; 4]);
+        assert_eq!(stream.in_flight(), 4);
+        let finishing = thread::spawn(move || stream.finish(Duration::from_secs(5)));
+        // The finish is sent from the other thread; wait for it to queue.
+        let mut queued = Vec::new();
+        while queued.len() < 2 {
+            queued.push(commands.recv().unwrap());
+        }
+        let (relay, relayed) = mpsc::channel();
+        for command in queued {
+            relay.send(command).unwrap();
+        }
+        let mut fake = FakeStream::default();
+        let interrupted = drive_yielding(1, &mut fake, &relayed, &yielding, &mut VecDeque::new());
+        assert!(interrupted.is_none());
+        assert_eq!(finishing.join().unwrap(), Ok("streamed 4".into()));
+        assert_eq!(yielding.consumed.load(Ordering::Acquire), 4);
+        assert_eq!(
+            *yielding.partial.lock().unwrap(),
+            Some(Partial {
+                stable: "heard 4".into(),
+                tentative: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_dictation_request_closes_a_yielding_stream_and_runs_next() {
+        let (engine, commands) = TranscriptionEngine::for_test();
+        let mut stream = engine.begin_yielding().unwrap();
+        let yielding = begun_yielding(&commands);
+        stream.feed(&[0.1; 4]);
+        let generation = engine.requests.load(Ordering::Acquire);
+        let _chunk = engine
+            .foreground(vec![0.0; 3], Box::new(|_, _| Ok("chunk".into())))
+            .unwrap();
+        assert_eq!(
+            engine.requests.load(Ordering::Acquire),
+            generation + 1,
+            "foreground work is a dictation-class request"
+        );
+        let _dictation = engine.begin().unwrap();
+        stream.feed(&[0.2; 4]);
+
+        let mut fake = FakeStream::default();
+        let mut deferred = VecDeque::new();
+        let interrupted = drive_yielding(1, &mut fake, &commands, &yielding, &mut deferred);
+        assert!(matches!(
+            interrupted,
+            Some(Command::Begin { stream: 2, .. })
+        ));
+        assert!(!stream.open(), "dictation closed the stream");
+        assert_eq!(fake.fed.len(), 4);
+        assert!(matches!(
+            deferred.as_slices().0,
+            [Command::Foreground { clip, .. }] if clip.len() == 3
+        ));
+        // A closed stream answers at once; its owner transcribes offline.
+        assert_eq!(stream.finish(Duration::from_secs(5)), Err(PREEMPTED.into()));
+    }
+
+    #[test]
+    fn an_open_dictation_stream_refuses_a_yielding_stream_instead_of_ending() {
+        let (engine, commands) = TranscriptionEngine::for_test();
+        let mut dictation = engine.begin().unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Begin { stream: 1, .. }
+        ));
+        let yielding = engine.begin_yielding().unwrap();
+        dictation.feed(&[0.1; 4]);
+        let _pending = engine
+            .finish_with(
+                Some(dictation),
+                vec![0.0; 4],
+                Box::new(|_, _| panic!("the dictation must not be retranscribed offline")),
+            )
+            .unwrap();
+        let mut fake = FakeStream::default();
+        let ended = drive_stream(
+            1,
+            &mut fake,
+            &commands,
+            &AtomicBool::new(false),
+            &mut VecDeque::new(),
+            &mut FeedStats::default(),
+        );
+        let StreamEnd::Finished { result, .. } = ended else {
+            panic!("the dictation stream did not finish");
+        };
+        assert_eq!(result, Ok("streamed 4".to_string()));
+        assert!(!yielding.open());
     }
 
     const SHORT: Deadlines = Deadlines {
@@ -1141,6 +1696,15 @@ mod tests {
             engine.retire();
             assert!(started.elapsed() < Duration::from_millis(500));
             release.send(()).unwrap();
+        }
+
+        #[test]
+        fn a_yielding_stream_on_a_model_that_cannot_stream_closes_at_once() {
+            let engine = TranscriptionEngine::start(Model::default()).unwrap();
+            engine.streams.store(true, Ordering::Release);
+            let mut stream = engine.begin_yielding().expect("streaming was claimed");
+            stream.feed(&[0.0; 3]);
+            assert_eq!(stream.finish(Duration::from_secs(5)), Err(PREEMPTED.into()));
         }
 
         #[test]

@@ -44,6 +44,10 @@ pub enum VoiceEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         processing: Option<DictationProcessing>,
+        /// Why a press was discarded as a chord: `key`, `hid-key`, `mouse`, or
+        /// `extra-modifier`. Absent for other phases and short taps.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Context {
         timestamp_ms: u64,
@@ -327,6 +331,18 @@ impl EventLog {
             phase,
             text: text.into(),
             processing: None,
+            reason: None,
+        })
+    }
+
+    /// A capture discarded as a chord, with its cause when known.
+    pub fn discarded_dictation(&self, reason: Option<&str>) -> io::Result<()> {
+        self.emit(&VoiceEvent::Dictation {
+            timestamp_ms: now_ms(),
+            phase: DictationPhase::Discarded,
+            text: String::new(),
+            processing: None,
+            reason: reason.map(Into::into),
         })
     }
 
@@ -341,6 +357,7 @@ impl EventLog {
             phase,
             text: text.into(),
             processing,
+            reason: None,
         })
     }
 }
@@ -616,6 +633,7 @@ mod tests {
                 latency_ms: 321,
                 fallback: Some("deadline exceeded".into()),
             }),
+            reason: None,
         };
 
         let decoded: VoiceEvent =
@@ -635,9 +653,39 @@ mod tests {
     }
 
     #[test]
+    fn discard_reason_is_additive() {
+        let old: VoiceEvent = serde_json::from_str(
+            r#"{"kind":"dictation","timestamp_ms":1,"phase":"discarded","text":""}"#,
+        )
+        .unwrap();
+        assert!(matches!(old, VoiceEvent::Dictation { reason: None, .. }));
+
+        let event = VoiceEvent::Dictation {
+            timestamp_ms: 1,
+            phase: DictationPhase::Discarded,
+            text: String::new(),
+            processing: None,
+            reason: Some("hid-key".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""reason":"hid-key""#), "{json}");
+        assert_eq!(serde_json::from_str::<VoiceEvent>(&json).unwrap(), event);
+
+        let without = serde_json::to_string(&VoiceEvent::Dictation {
+            timestamp_ms: 1,
+            phase: DictationPhase::Discarded,
+            text: String::new(),
+            processing: None,
+            reason: None,
+        })
+        .unwrap();
+        assert!(!without.contains("reason"), "{without}");
+    }
+
+    #[test]
     fn reopening_log_preserves_existing_events() {
         let path = std::env::temp_dir().join(format!(
-            "voice-control-events-{}-{}.ndjson",
+            "hex-events-{}-{}.ndjson",
             std::process::id(),
             now_ms()
         ));
@@ -656,7 +704,7 @@ mod tests {
     #[test]
     fn reader_tails_complete_records_and_resets_at_session_boundaries() {
         let path = std::env::temp_dir().join(format!(
-            "voice-control-event-reader-{}-{}.ndjson",
+            "hex-event-reader-{}-{}.ndjson",
             std::process::id(),
             now_ms()
         ));
