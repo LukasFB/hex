@@ -3,15 +3,14 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
-#import <IOKit/hidsystem/IOHIDLib.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 
 typedef NS_ENUM(NSInteger, HexPermission) {
-    HexPermissionInputMonitoring = 0,
     HexPermissionAccessibility = 1,
     HexPermissionMicrophone = 2,
     HexPermissionSystemAudio = 3,
+    HexPermissionScreenRecording = 4,
 };
 
 static NSPanel *guidePanel;
@@ -59,14 +58,14 @@ static BOOL accessibilityRenamed(void) {
 /// The name of the Privacy & Security list each permission lives in.
 const char *hex_permission_list_name(int permission) {
     switch ((HexPermission)permission) {
-        case HexPermissionInputMonitoring:
-            return "Input Monitoring";
         case HexPermissionAccessibility:
             return accessibilityRenamed() ? "Device Control and Data Access" : "Accessibility";
         case HexPermissionMicrophone:
             return "Microphone";
         case HexPermissionSystemAudio:
             return "System Audio Recording Only";
+        case HexPermissionScreenRecording:
+            return "Screen & System Audio Recording";
     }
     return "Privacy & Security";
 }
@@ -224,8 +223,6 @@ static BOOL permissionGranted(void) {
     switch (activePermission) {
         // What System Settings shows now: the preflights keep their launch
         // answer until Hex restarts.
-        case HexPermissionInputMonitoring:
-            return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted;
         case HexPermissionAccessibility:
             return AXIsProcessTrusted();
         case HexPermissionMicrophone:
@@ -233,6 +230,8 @@ static BOOL permissionGranted(void) {
                    AVAuthorizationStatusAuthorized;
         case HexPermissionSystemAudio:
             return systemAudioGranted();
+        case HexPermissionScreenRecording:
+            return CGPreflightScreenCaptureAccess();
     }
     return NO;
 }
@@ -438,9 +437,6 @@ void hex_show_permission_guide(int permission) {
     NSString *appName = hexAppName(bundleURL);
     NSString *pane;
     switch (activePermission) {
-        case HexPermissionInputMonitoring:
-            pane = @"Privacy_ListenEvent";
-            break;
         case HexPermissionAccessibility:
             pane = @"Privacy_Accessibility";
             break;
@@ -449,6 +445,9 @@ void hex_show_permission_guide(int permission) {
             break;
         case HexPermissionSystemAudio:
             pane = @"Privacy_AudioCapture";
+            break;
+        case HexPermissionScreenRecording:
+            pane = @"Privacy_ScreenCapture";
             break;
     }
     // The Microphone list only holds apps that asked, so a refused

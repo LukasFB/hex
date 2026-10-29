@@ -3,10 +3,10 @@
 //! when typing pauses, like a mode's corrections.
 
 use rune::{El, TextEdit, edit_access, row};
-use rune_kit::{ButtonSize, IconButton, IconButtonVariant, TextInput};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, TextInput};
 
 use super::Ui;
-use super::controls::{Paint, note, section, setting_row};
+use super::controls::{METRICS, Paint, note, section, setting_row};
 use super::lists::{remove_button, small_button};
 use crate::desktop_i18n::tr;
 use crate::vocabulary::{self, VocabularyEntry};
@@ -86,7 +86,7 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
     let entries = ui.vocabulary.project();
     let add = IconButton::new(PLUS)
         .variant(IconButtonVariant::Ghost)
-        .size(ButtonSize::Normal)
+        .control_size(ControlSize::Regular)
         .label(tr("Add term"))
         .on_press(add_row)
         .build(p.k)
@@ -117,7 +117,7 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
         rows.push(
             row()
                 .key(format!("term{index}"))
-                .px(12.0)
+                .px(METRICS.row_px)
                 .py(6.0)
                 .gap(8.0)
                 .center_y()
@@ -143,9 +143,11 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
                         .grow(1.0)
                         .shrink(),
                 )
-                .child(remove_button(p, ButtonSize::Normal, move |ui: &mut Ui| {
-                    remove_row(ui, index)
-                })),
+                .child(remove_button(
+                    p,
+                    ControlSize::Regular,
+                    move |ui: &mut Ui| remove_row(ui, index),
+                )),
         );
     }
     if ui.vocabulary.clamped() {

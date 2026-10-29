@@ -36,8 +36,11 @@ pub struct Parakeet {
     selection: Option<TranscriptionSelection>,
     max_audio_samples: Option<usize>,
     stream: Option<transcribe_cpp::StreamOptions>,
+    _weights: procwatch::Lease,
 }
 
+/// Loaded model weights, estimated from the model file size (they live in Metal buffers).
+static MODEL_WEIGHTS: procwatch::Gauge = procwatch::Gauge::new("speech.model_weights");
 static TRANSCRIBE_LOGGING: Once = Once::new();
 const TRANSCRIPTION_SAMPLES_PER_MS: usize = 16;
 const MAX_PENDING_OUTPUTS: usize = 16;
@@ -173,6 +176,9 @@ struct JobControl {
     output_started: Mutex<bool>,
     /// The control phrase a voice transcript ended with.
     spoken: OnceLock<DictationControl>,
+    /// A programmatic dictation's job: its owner app cancels it through the
+    /// API, so Escape never does.
+    owner_cancels: bool,
 }
 
 impl JobControl {
@@ -185,6 +191,15 @@ impl JobControl {
             return false;
         }
         !self.cancelled.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether [`JobControl::cancel`] would cancel it now.
+    fn cancellable(&self) -> bool {
+        let output_started = self
+            .output_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        !*output_started && !self.is_cancelled()
     }
 
     fn is_cancelled(&self) -> bool {
@@ -256,7 +271,14 @@ impl WorkerState {
         self.jobs
             .iter()
             .rev()
+            .filter(|(_, control)| !control.owner_cancels)
             .find_map(|(&job_id, control)| control.cancel().then_some(job_id))
+    }
+
+    fn has_escape_cancellable_job(&self) -> bool {
+        self.jobs
+            .values()
+            .any(|control| !control.owner_cancels && control.cancellable())
     }
 }
 
@@ -385,7 +407,10 @@ impl DictationWorker {
         let (Some(engine), Some(jobs)) = (&self.engine, &self.inference_jobs) else {
             return Err("dictation worker is unavailable");
         };
-        let control = Arc::new(JobControl::default());
+        let control = Arc::new(JobControl {
+            owner_cancels: matches!(target, TranscriptionTarget::Service),
+            ..JobControl::default()
+        });
         let (_, selection) = crate::app_settings::transcription_selection();
         let submitted_at = Instant::now();
         let audio_ms = clip.duration_ms();
@@ -515,6 +540,15 @@ impl DictationWorker {
             .unwrap_or_else(|error| error.into_inner())
             .jobs
             .len()
+    }
+
+    /// Whether Escape has a queued job to cancel; programmatic dictations'
+    /// jobs don't count.
+    pub fn has_escape_cancellable_job(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .has_escape_cancellable_job()
     }
 
     pub fn cancel_latest(&self) -> Option<DictationJobId> {
@@ -678,6 +712,110 @@ fn process_job_text(
         }
         profiles.process_cancellable(&job.text, &job.context, &job.control.cancelled)
     }
+}
+
+/// The longest audio the capture path hands the model at once; longer
+/// captures are transcribed in consecutive chunks with their times offset.
+#[cfg(hex_capture)]
+const WORD_CHUNK_SAMPLES: usize = 30 * 16_000;
+/// How long a capture chunk waits for dictation to go idle before it is
+/// queued anyway; the engine still never runs it inside a live stream.
+#[cfg(hex_capture)]
+const WORD_DICTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Transcribes a capture's 16 kHz audio with word timestamps on the engine's
+/// warm model (the `capture` experiment). Before each chunk it waits while
+/// dictation is busy (from the shortcut press through inference); each chunk
+/// is then a foreground request: after the dictation already sent, before
+/// meeting chunks, and never inside a dictation live stream, which finishes
+/// first. No second copy of the model is loaded, and only a weak reference
+/// to the engine is kept between chunks. Quitting stops it between chunks.
+/// Every chunk runs on `selection`.
+#[cfg(hex_capture)]
+pub fn transcribe_with_words(
+    engine: &std::sync::Weak<TranscriptionEngine>,
+    selection: &crate::transcription_models::TranscriptionSelection,
+    samples: Vec<f32>,
+) -> Result<crate::transcription::Transcript> {
+    if samples.is_empty() {
+        return Ok(crate::transcription::Transcript::default());
+    }
+    transcribe_in_chunks(samples, WORD_CHUNK_SAMPLES, |chunk| {
+        wait_for_dictation_idle()?;
+        let selection = selection.clone();
+        let (send, transcript) = mpsc::sync_channel(1);
+        let offline: crate::transcription_engine::Offline = Box::new(move |model, samples| {
+            let _busy = DictationInference::begin();
+            let transcriber = model
+                .activate(&selection)
+                .map_err(|error| format!("{error:#}"))?;
+            let result = transcriber
+                .transcribe_segments(samples)
+                .map_err(|error| format!("{error:#}"))?;
+            let text = result.text.clone();
+            let _ = send.send(result);
+            Ok(text)
+        });
+        let pending = engine
+            .upgrade()
+            .ok_or_else(|| eyre!("the transcription engine stopped"))?
+            .foreground(chunk, offline)?;
+        pending.wait().map_err(|error| eyre!(error))?;
+        transcript
+            .try_recv()
+            .map_err(|_| eyre!("the transcription returned no words"))
+    })
+}
+
+#[cfg(hex_capture)]
+fn wait_for_dictation_idle() -> Result<()> {
+    let started = Instant::now();
+    while dictation_busy()
+        && !crate::process_exit::quitting()
+        && started.elapsed() < WORD_DICTATION_WAIT
+    {
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if crate::process_exit::quitting() {
+        return Err(eyre!("Hex is quitting"));
+    }
+    Ok(())
+}
+
+/// Transcribes `samples` in chunks of at most `chunk_samples`, offsetting
+/// each chunk's segment and word times by where it starts.
+#[cfg(hex_capture)]
+fn transcribe_in_chunks(
+    samples: Vec<f32>,
+    chunk_samples: usize,
+    mut transcribe: impl FnMut(Vec<f32>) -> Result<crate::transcription::Transcript>,
+) -> Result<crate::transcription::Transcript> {
+    use crate::transcription::{Transcript, TranscriptSegment};
+    let shift = |spans: Vec<TranscriptSegment>, offset_ms: i64| {
+        spans.into_iter().filter_map(move |span| {
+            let text = span.text.trim();
+            let start_ms = span.start_ms.max(0);
+            (!text.is_empty()).then(|| TranscriptSegment {
+                start_ms: start_ms + offset_ms,
+                end_ms: span.end_ms.max(start_ms) + offset_ms,
+                text: text.to_string(),
+            })
+        })
+    };
+    let mut merged = Transcript::default();
+    let mut texts = Vec::new();
+    for (index, chunk) in samples.chunks(chunk_samples.max(1)).enumerate() {
+        let offset_ms = (index * chunk_samples / TRANSCRIPTION_SAMPLES_PER_MS) as i64;
+        let result = transcribe(chunk.to_vec())?;
+        let text = result.text.trim();
+        if !text.is_empty() {
+            texts.push(text.to_string());
+        }
+        merged.segments.extend(shift(result.segments, offset_ms));
+        merged.words.extend(shift(result.words, offset_ms));
+    }
+    merged.text = texts.join(" ");
+    Ok(merged)
 }
 
 /// Waits for each accepted job's transcript in submission order, then hands
@@ -849,6 +987,19 @@ impl DictationInference {
 impl Drop for DictationInference {
     fn drop(&mut self) {
         DICTATION_INFERENCE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Makes [`dictation_busy`] hold until dropped, as a dictation would.
+#[cfg(test)]
+pub(crate) struct DictationBusyForTest {
+    _busy: DictationInference,
+}
+
+#[cfg(test)]
+pub(crate) fn dictation_busy_for_test() -> DictationBusyForTest {
+    DictationBusyForTest {
+        _busy: DictationInference::begin(),
     }
 }
 
@@ -1112,7 +1263,7 @@ impl Parakeet {
             model_path,
             &ModelOptions {
                 backend: Backend::Metal,
-                device: None,
+                ..Default::default()
             },
         )
         .wrap_err_with(|| {
@@ -1139,7 +1290,7 @@ impl Parakeet {
             variant,
             "loaded transcription model"
         );
-        let capabilities = model.capabilities();
+        let capabilities = model.capabilities()?;
         let mut language = None;
         let mut family = None;
         if let (Some(selection), Some(definition)) = (selection, definition) {
@@ -1180,6 +1331,7 @@ impl Parakeet {
             language = runtime_language;
         }
         let session = OfflineGgufSession::new(model)?;
+        let weights_bytes = std::fs::metadata(model_path).map_or(0, |meta| meta.len() as usize);
         Ok(Self {
             session,
             options: RunOptions {
@@ -1199,6 +1351,7 @@ impl Parakeet {
                 capabilities.max_audio_ms,
             ),
             stream: None,
+            _weights: MODEL_WEIGHTS.track(weights_bytes),
         })
     }
 
@@ -1897,6 +2050,111 @@ mod tests {
         }
     }
 
+    #[cfg(hex_capture)]
+    #[test]
+    fn chunked_word_transcription_keeps_word_times_across_chunks() {
+        use crate::transcription::{Transcript, TranscriptSegment};
+        let span = |start_ms, end_ms, text: &str| TranscriptSegment {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        };
+        let mut calls = Vec::new();
+        let merged = transcribe_in_chunks(vec![0.0; 16_000 * 25], 16_000 * 10, |chunk| {
+            calls.push(chunk.len());
+            let chunk_index = calls.len();
+            Ok(Transcript {
+                text: format!(" part {chunk_index} "),
+                segments: vec![span(0, 900, " part ")],
+                words: vec![
+                    span(-5, 400, " part"),
+                    span(450, 300, "two"),
+                    span(500, 600, "  "),
+                ],
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, [160_000, 160_000, 80_000]);
+        assert_eq!(merged.text, "part 1 part 2 part 3");
+        let words = merged
+            .words
+            .iter()
+            .map(|word| (word.start_ms, word.end_ms, word.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                (0, 400, "part"),
+                (450, 450, "two"),
+                (10_000, 10_400, "part"),
+                (10_450, 10_450, "two"),
+                (20_000, 20_400, "part"),
+                (20_450, 20_450, "two"),
+            ]
+        );
+        assert_eq!(merged.segments[2].start_ms, 20_000);
+    }
+
+    #[cfg(hex_capture)]
+    #[test]
+    fn word_transcription_is_a_foreground_request_on_the_shared_engine() {
+        use crate::transcription_engine::Command as EngineCommand;
+        let (engine, commands) = TranscriptionEngine::for_test();
+        let engine = Arc::new(engine);
+        let weak = Arc::downgrade(&engine);
+        assert!(
+            transcribe_with_words(&weak, &Default::default(), Vec::new())
+                .unwrap()
+                .words
+                .is_empty()
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "silence never reaches the model"
+        );
+
+        // A busy dictation holds the chunk back until it is idle.
+        let busy = DictationInference::begin();
+        let request = {
+            let weak = weak.clone();
+            thread::spawn(move || {
+                transcribe_with_words(
+                    &weak,
+                    &Default::default(),
+                    vec![0.1; WORD_CHUNK_SAMPLES + 1_600],
+                )
+            })
+        };
+        assert!(
+            commands
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        drop(busy);
+        let command = commands
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // A foreground request: after dictation already sent, counted as a
+        // request so meeting chunks yield to it, and never inside a stream.
+        assert!(matches!(
+            command,
+            EngineCommand::Foreground { ref clip, .. } if clip.len() == WORD_CHUNK_SAMPLES
+        ));
+        // The next chunk waits for this one, so a dictation sent meanwhile
+        // runs first.
+        assert!(
+            commands
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(command);
+        assert!(request.join().unwrap().is_err());
+        // Only a weak reference is held: once the engine is gone, a capture
+        // fails instead of keeping it alive.
+        drop(engine);
+        assert!(transcribe_with_words(&weak, &Default::default(), vec![0.1; 16]).is_err());
+    }
+
     #[test]
     fn repeated_cancellation_walks_back_through_pending_jobs() {
         let jobs = [0, 1, 2]
@@ -1916,10 +2174,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires VOICE_CONTROL_DICTATION_FIXTURE_DIR and the installed Parakeet model"]
+    fn escape_skips_programmatic_dictation_jobs() {
+        let owned = || {
+            Arc::new(JobControl {
+                owner_cancels: true,
+                ..JobControl::default()
+            })
+        };
+        let state = WorkerState {
+            next_sequence: 2,
+            jobs: BTreeMap::from([
+                (DictationJobId(0), Arc::new(JobControl::default())),
+                (DictationJobId(1), owned()),
+            ]),
+            pending_pastes: 0,
+        };
+        assert!(state.has_escape_cancellable_job());
+        assert_eq!(state.cancel_latest(), Some(DictationJobId(0)));
+        assert_eq!(state.cancel_latest(), None);
+        assert!(!state.has_escape_cancellable_job());
+        assert!(!state.jobs[&DictationJobId(1)].is_cancelled());
+
+        // A job whose output has started can no longer be cancelled.
+        let pasting = WorkerState {
+            next_sequence: 1,
+            jobs: BTreeMap::from([(DictationJobId(0), Arc::new(JobControl::default()))]),
+            pending_pastes: 0,
+        };
+        assert!(pasting.jobs[&DictationJobId(0)].begin_output());
+        assert!(!pasting.has_escape_cancellable_job());
+        assert_eq!(pasting.cancel_latest(), None);
+
+        let only_owned = WorkerState {
+            next_sequence: 1,
+            jobs: BTreeMap::from([(DictationJobId(0), owned())]),
+            pending_pastes: 0,
+        };
+        assert!(!only_owned.has_escape_cancellable_job());
+    }
+
+    #[test]
+    #[ignore = "requires HEX_DICTATION_FIXTURE_DIR and the installed Parakeet model"]
     fn dictation_protocol_audio() {
-        let directory =
-            PathBuf::from(std::env::var("VOICE_CONTROL_DICTATION_FIXTURE_DIR").unwrap());
+        let directory = PathBuf::from(std::env::var("HEX_DICTATION_FIXTURE_DIR").unwrap());
         let protocol = DictationProtocol::try_new(
             vec!["say".into()],
             vec!["say paste".into(), "say stop".into()],
@@ -1961,9 +2258,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires VOICE_CONTROL_STUTTER_FIXTURE and the installed Parakeet model"]
+    #[ignore = "requires HEX_STUTTER_FIXTURE and the installed Parakeet model"]
     fn tdt_decoder_does_not_repeat_single_letter_tokens() {
-        let path = PathBuf::from(std::env::var("VOICE_CONTROL_STUTTER_FIXTURE").unwrap());
+        let path = PathBuf::from(std::env::var("HEX_STUTTER_FIXTURE").unwrap());
         let mut reader = WavReader::open(path).unwrap();
         let sample_rate = reader.spec().sample_rate;
         let samples = reader

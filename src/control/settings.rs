@@ -97,6 +97,16 @@ const MODEL_CHANGE: &str = "change the transcription model with `hex model use`"
 
 const KEYS: &[Key] = &[
     key(
+        "keyboard_model_switching.enabled",
+        Kind::Bool,
+        "Switch the model when the keyboard input source changes (macOS)",
+    ),
+    key(
+        "keyboard_model_switching.mappings",
+        Kind::Json,
+        "Input-source IDs mapped to a model and language; absent sources don't switch (macOS)",
+    ),
+    key(
         "commands_enabled",
         Kind::Bool,
         "Voice commands (loads the command model; keeps the microphone ready)",
@@ -116,15 +126,30 @@ const KEYS: &[Key] = &[
         UNIT,
         "Tone volume from 0 to 1; 0 turns tones off",
     ),
+    key(
+        "sound_theme",
+        Kind::Choice(&["signature", "classic"]),
+        "Which feedback sounds play: Hex's signature set or the classic tones",
+    ),
     optional(
         "microphone",
         Kind::Text,
-        "Preferred microphone by name; none picks one automatically",
+        "Microphone by name; system-default (or none) follows the system's default input",
     ),
     key(
         "recording_audio_behavior",
-        Kind::Choice(&["mute", "pause_media", "do_nothing"]),
+        Kind::Choice(&["mute", "pause_media", "do_nothing", "duck"]),
         "What other audio does while you dictate",
+    ),
+    key(
+        "recording_duck_volume",
+        UNIT,
+        "Fraction of original output volume while lowering audio (macOS), from 0 to 1",
+    ),
+    key(
+        "pause_browser_media",
+        Kind::Bool,
+        "Also pause a playing browser tab while dictating (macOS, with Pause media)",
     ),
     key(
         "double_tap_lock",
@@ -310,9 +335,14 @@ const KEYS: &[Key] = &[
         Kind::Bool,
         "Paste with Ctrl-Shift-V for terminals (Linux)",
     ),
+    key(
+        "share_dictation_shortcut",
+        Kind::Bool,
+        "Let other apps see the dictation shortcut too (Windows)",
+    ),
     optional(
         "ui_language",
-        Kind::Choice(&["en", "pl", "zh", "ja", "de", "es"]),
+        Kind::Choice(&["en", "pl", "zh", "ja", "de", "es", "uk"]),
         "Interface language; none follows the system",
     ),
     key(
@@ -320,7 +350,78 @@ const KEYS: &[Key] = &[
         Kind::Choice(&["top", "bottom", "hidden"]),
         "Where the dictation HUD appears",
     ),
+    optional(
+        "updates.channel",
+        Kind::Choice(&["stable", "dev"]),
+        "Update channel; none follows the build (dev builds use dev, others stable)",
+    ),
 ];
+
+/// Captures exist only in builds with the `capture` build option.
+#[cfg(hex_capture)]
+const CAPTURE_KEYS: &[Key] = &[
+    key(
+        "capture.enabled",
+        Kind::Bool,
+        "Scrawl captures: record the screen with narration (the capture experiment)",
+    ),
+    key(
+        "capture.hotkey",
+        Kind::Shortcut(HotkeySlot::Capture),
+        "The capture shortcut: press to start a capture and again to finish it",
+    ),
+    key(
+        "capture.list_hotkey",
+        Kind::Shortcut(HotkeySlot::CaptureList),
+        "Opens the capture capsule's send-to list while a capsule shows or the latest \
+         capture waits for a pick",
+    ),
+    key(
+        "capture.transcriber",
+        Kind::Choice(&["parakeet", "apple"]),
+        "What transcribes a capture's narration: Hex's loaded model or Apple's",
+    ),
+    optional(
+        "capture.folder",
+        Kind::Path,
+        "Folder for new captures; none uses Scrawl's captures folder",
+    ),
+    optional(
+        "capture.media_days",
+        RETENTION_DAYS,
+        "Days a capture keeps its video and audio; none keeps them",
+    ),
+    optional(
+        "capture.bundle_days",
+        RETENTION_DAYS,
+        "Days a capture is kept; none keeps it",
+    ),
+    key(
+        "capture.capsule_flow",
+        Kind::Choice(&["list", "toast", "menu_bar", "cursor", "notch"]),
+        "How the capture capsule offers where to send a capture (prototypes): a list, a \
+         one-line toast, the menu bar, a card at the pointer, or a notch",
+    ),
+    key(
+        "capture.routing",
+        Kind::Json,
+        "Where captures go among OpenCode sessions: Scrawl's router settings (autoSend, sites, apps, smartRouting, …) as a JSON object",
+    ),
+    key(
+        "capture.show_overlays_in_recordings",
+        Kind::Bool,
+        "Let screen recordings, captures included, show Hex's capsules, ink, and HUD (for demos)",
+    ),
+];
+#[cfg(hex_capture)]
+const RETENTION_DAYS: Kind = Kind::Integer { min: 1, max: 3650 };
+#[cfg(not(hex_capture))]
+const CAPTURE_KEYS: &[Key] = &[];
+
+/// Every key, in registry order.
+fn keys() -> impl Iterator<Item = &'static Key> {
+    KEYS.iter().chain(CAPTURE_KEYS)
+}
 
 /// Settings `hex settings` never shows: Hex's own bookkeeping.
 #[cfg(test)]
@@ -342,6 +443,8 @@ pub struct ShortcutRules {
 pub enum Effect {
     HistoryRetention(crate::history::HistoryRetention),
     DockIcon,
+    /// Check the newly chosen channel now rather than within the hour.
+    CheckForUpdates,
 }
 
 /// A validated change, ready to save.
@@ -361,15 +464,14 @@ impl Change {
 /// Every setting, in registry order.
 pub fn list(settings: &AppSettings) -> Vec<SettingValue> {
     let json = serde_json::to_value(settings).unwrap_or(Value::Null);
-    KEYS.iter().map(|key| value_of(key, &json)).collect()
+    keys().map(|key| value_of(key, &json)).collect()
 }
 
 /// One setting, or every setting under a prefix such as `meetings`.
 pub fn get(settings: &AppSettings, name: &str) -> Result<Vec<SettingValue>, ControlError> {
     let json = serde_json::to_value(settings).unwrap_or(Value::Null);
     let prefix = format!("{name}.");
-    let found: Vec<_> = KEYS
-        .iter()
+    let found: Vec<_> = keys()
         .filter(|key| key.key == name || key.key.starts_with(&prefix))
         .map(|key| value_of(key, &json))
         .collect();
@@ -380,8 +482,7 @@ pub fn get(settings: &AppSettings, name: &str) -> Result<Vec<SettingValue>, Cont
 }
 
 fn unknown(name: &str) -> ControlError {
-    let near = KEYS
-        .iter()
+    let near = keys()
         .map(|key| key.key)
         .find(|key| {
             key.ends_with(name)
@@ -438,8 +539,7 @@ pub fn apply(
     confirm: bool,
     shortcuts: &ShortcutRules,
 ) -> Result<Change, ControlError> {
-    let key = KEYS
-        .iter()
+    let key = keys()
         .find(|key| key.key == name)
         .ok_or_else(|| unknown(name))?;
     if let Some(why) = key.read_only {
@@ -504,7 +604,11 @@ pub fn apply(
                 ));
             }
         }
-        "dictation_hotkey" | "edit_hotkey" | "paste_last_hotkey" => {
+        "dictation_hotkey"
+        | "edit_hotkey"
+        | "paste_last_hotkey"
+        | "capture.hotkey"
+        | "capture.list_hotkey" => {
             let Kind::Shortcut(slot) = key.kind else {
                 unreachable!("shortcut keys have the shortcut kind");
             };
@@ -512,6 +616,10 @@ pub fn apply(
                 HotkeySlot::Dictation => Some(&candidate.dictation_hotkey),
                 HotkeySlot::VoiceAction => Some(&candidate.edit_hotkey),
                 HotkeySlot::PasteLast => candidate.paste_last_hotkey.as_ref(),
+                #[cfg(hex_capture)]
+                HotkeySlot::Capture => Some(&candidate.capture.hotkey),
+                #[cfg(hex_capture)]
+                HotkeySlot::CaptureList => Some(&candidate.capture.list_hotkey),
             };
             if let Some(binding) = binding {
                 (shortcuts.rule)(slot, binding).map_err(|why| invalid(name, &why))?;
@@ -539,6 +647,13 @@ pub fn apply(
                  shortcut first",
             ));
         }
+        "keyboard_model_switching.mappings" => {
+            for choice in candidate.keyboard_model_switching.mappings.values() {
+                choice
+                    .validate()
+                    .map_err(|error| invalid(name, &error.to_string()))?;
+            }
+        }
         "transcription.recognition_hints" => {
             let model = crate::transcription_models::definition(candidate.transcription.model);
             if !model.supports_recognition_hints {
@@ -560,8 +675,32 @@ pub fn apply(
                 }
             }
         }
+        #[cfg(hex_capture)]
+        "capture.enabled"
+            if candidate.capture.enabled
+                && candidate.hotkey_in_use(HotkeySlot::Capture, &candidate.capture.hotkey) =>
+        {
+            return Err(ControlError::new(
+                "shortcut-in-use",
+                "The capture shortcut is already in use; set capture.hotkey to another \
+                 shortcut first",
+            ));
+        }
+        #[cfg(hex_capture)]
+        "capture.enabled"
+            if candidate.capture.enabled
+                && candidate
+                    .hotkey_in_use(HotkeySlot::CaptureList, &candidate.capture.list_hotkey) =>
+        {
+            return Err(ControlError::new(
+                "shortcut-in-use",
+                "The send-to list shortcut is already in use; set capture.list_hotkey to \
+                 another shortcut first",
+            ));
+        }
         "history_retention" => effects.push(Effect::HistoryRetention(candidate.history_retention)),
         "show_dock_icon" => effects.push(Effect::DockIcon),
+        "updates.channel" => effects.push(Effect::CheckForUpdates),
         _ => {}
     }
     Ok(Change {
@@ -582,6 +721,9 @@ fn parse(key: &Key, raw: &str, shortcuts: &ShortcutRules) -> Result<Value, Contr
     let name = key.key;
     let trimmed = raw.trim();
     if key.optional && matches!(trimmed.to_ascii_lowercase().as_str(), "none" | "null" | "") {
+        return Ok(Value::Null);
+    }
+    if name == "microphone" && trimmed.eq_ignore_ascii_case("system-default") {
         return Ok(Value::Null);
     }
     match key.kind {
@@ -818,8 +960,7 @@ mod tests {
         let mut paths = Vec::new();
         leaves(&json, String::new(), &mut paths);
         for path in &paths {
-            let covered = KEYS
-                .iter()
+            let covered = keys()
                 .map(|key| key.key)
                 .chain(INTERNAL.iter().copied())
                 .chain(OWN_COMMAND.iter().copied())
@@ -829,24 +970,96 @@ mod tests {
                 "settings.json has `{path}`, which `hex settings` can't name"
             );
         }
-        for key in KEYS {
+        for key in keys() {
             assert!(
                 json.pointer(&pointer(key.key)).is_some(),
                 "`{}` names no setting",
                 key.key
             );
         }
-        let mut names: Vec<_> = KEYS.iter().map(|key| key.key).collect();
+        let mut names: Vec<_> = keys().map(|key| key.key).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), KEYS.len(), "a key is listed twice");
+        assert_eq!(names.len(), keys().count(), "a key is listed twice");
+    }
+
+    #[cfg(hex_capture)]
+    #[test]
+    fn capture_routing_is_set_as_one_object_without_a_jev_key() {
+        let settings = AppSettings::default();
+        let value = r#"{"smartRouting": true, "sites": {"https://example.com": "ses_a"},
+            "jevApiKey": "not-a-real-key"}"#;
+        let change = apply(&settings, "capture.routing", value, false, &rules()).unwrap();
+        let config = change.settings.capture.routing.config();
+        assert!(config.smart_routing);
+        assert_eq!(config.sites.len(), 1);
+        assert_eq!(config.jev_api_key, None);
+        let shown = get(&change.settings, "capture.routing").unwrap();
+        assert!(!shown[0].value.to_string().contains("not-a-real-key"));
+        assert_eq!(
+            apply(&settings, "capture.routing", "[", false, &rules())
+                .unwrap_err()
+                .code,
+            "invalid-value"
+        );
+    }
+
+    #[test]
+    fn keyboard_model_switching_settings_map_sources_to_a_model_and_its_language() {
+        let settings = apply(
+            &AppSettings::default(),
+            "keyboard_model_switching.enabled",
+            "on",
+            false,
+            &rules(),
+        )
+        .unwrap()
+        .settings;
+        assert!(settings.keyboard_model_switching.enabled);
+        let change = apply(
+            &settings,
+            "keyboard_model_switching.mappings",
+            r#"{"com.apple.keylayout.Spanish":{"model":"parakeet_v3","language":"es"}}"#,
+            false,
+            &rules(),
+        )
+        .unwrap();
+        assert_eq!(
+            change
+                .settings
+                .keyboard_model_switching
+                .mappings
+                .get("com.apple.keylayout.Spanish"),
+            Some(&crate::app_settings::KeyboardModelChoice {
+                model: crate::transcription_models::TranscriptionModelId::ParakeetV3,
+                language: "es".into(),
+            })
+        );
+        for invalid in [
+            r#"{"Spanish":"parakeet_v3"}"#,
+            r#"{"Spanish":{"model":"unknown-model","language":"es"}}"#,
+            r#"{"Japanese":{"model":"parakeet_unified_en","language":"ja"}}"#,
+            r#"{"ABC":{"model":"apple_speech","language":"en"}}"#,
+        ] {
+            assert!(
+                apply(
+                    &settings,
+                    "keyboard_model_switching.mappings",
+                    invalid,
+                    false,
+                    &rules()
+                )
+                .is_err(),
+                "{invalid} was accepted"
+            );
+        }
     }
 
     #[test]
     fn settings_read_by_key_and_prefix() {
         let settings = AppSettings::default();
         let all = list(&settings);
-        assert_eq!(all.len(), KEYS.len());
+        assert_eq!(all.len(), keys().count());
         let calendar = get(&settings, "meetings.calendar").unwrap();
         assert_eq!(calendar.len(), 4);
         let lead = get(&settings, "meetings.calendar.lead_minutes").unwrap();
@@ -914,6 +1127,10 @@ mod tests {
         assert_eq!(change.settings.meetings.calendar.lead_minutes, 5);
         let change = apply(&settings, "ui_language", "none", false, &rules()).unwrap();
         assert_eq!(change.settings.ui_language, None);
+        let mut saved = settings.clone();
+        saved.microphone = Some("USB Mic".into());
+        let change = apply(&saved, "microphone", "system-default", false, &rules()).unwrap();
+        assert_eq!(change.settings.microphone, None);
         let change = apply(&settings, "history_retention", "month", false, &rules()).unwrap();
         assert_eq!(
             change.effects,

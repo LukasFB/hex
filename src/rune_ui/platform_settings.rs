@@ -8,8 +8,8 @@
 use rune::{El, Icon, row, text};
 
 use super::controls::{
-    ButtonKind, Choice, DESCRIPTION, Paint, button, note, row_switch, section, segmented, select,
-    setting_row, toggle_row,
+    ButtonKind, Choice, DESCRIPTION, Paint, button, note, pressable_row, row_switch, section,
+    segmented, select, setting_row, toggle_row,
 };
 use super::lists::{PermissionControl, Tone, permission_control, tone_tag};
 use super::platform::{CalendarRequest, MeetingRequest, NotesAvailability, PlatformRequest};
@@ -37,20 +37,20 @@ fn permission_copy(
             tr("Microphone"),
             tr("Hex cannot record dictation until microphone access is restored."),
         ),
-        PermissionKind::InputMonitoring => (
-            "permission-input-monitoring",
-            tr("Input Monitoring"),
-            tr("Hex cannot recognize the dictation shortcut in other apps."),
-        ),
         PermissionKind::Accessibility => (
             "permission-accessibility",
             accessibility_name(accessibility_renamed),
-            tr("Hex cannot paste completed dictation into the foreground app."),
+            tr("Hex cannot recognize the dictation shortcut or paste into other apps."),
         ),
         PermissionKind::SystemAudio => (
             "permission-system-audio",
             tr("Screen & System Audio Recording"),
             tr("Required to hear the other participants."),
+        ),
+        PermissionKind::ScreenRecording => (
+            "permission-screen-recording",
+            tr("Screen Recording"),
+            tr("Lets a capture record your screen"),
         ),
     }
 }
@@ -457,6 +457,7 @@ fn calendars_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
                 } else {
                     format!("{} · {}", info.title, info.source)
                 },
+                detail: None,
                 selected: calendar.includes(&info.id),
                 choose: Box::new(move |ui: &mut Ui| {
                     let id = id.clone();
@@ -587,15 +588,10 @@ pub(super) fn launch_at_login_rows(ui: &Ui, p: Paint) -> Vec<El> {
         status,
         Some(LoginItemStatus::Enabled | LoginItemStatus::Disabled)
     ) {
-        row = row
-            .role("toggle")
-            .focusable(true)
-            .hover(p.k.c.hover)
-            .press(p.k.c.pressed)
-            .on_press(|ui: &mut Ui| {
-                let enabled = !ui.platform.login_item_on();
-                ui.ask(PlatformRequest::SetLaunchAtLogin(enabled));
-            });
+        row = pressable_row(row).on_press(|ui: &mut Ui| {
+            let enabled = !ui.platform.login_item_on();
+            ui.ask(PlatformRequest::SetLaunchAtLogin(enabled));
+        });
     }
     let mut rows = vec![row];
     if let Some(error) = &ui.platform.login_item_error {
@@ -759,22 +755,34 @@ const SIDES: [ModifierSide; 3] = [
     ModifierSide::Right,
 ];
 
-/// Left, Either, or Right for a modifier-only shortcut (macOS), before its
-/// recorder; sides that would collide with another shortcut are disabled.
-pub(super) fn side_selector(ui: &Ui, p: Paint, target: ShortcutTarget) -> Option<El> {
+/// The side [`side_selector`] shows for `target`, if it shows one: the
+/// keycaps beside it then leave the side to it.
+pub(super) fn picked_side(ui: &Ui, target: ShortcutTarget) -> Option<ModifierSide> {
     if !ui.platform.caps.modifier_sides {
         return None;
     }
-    let side = super::settings::binding(&ui.settings, target)?.standalone_side()?;
+    super::settings::binding(&ui.settings, target)?.standalone_side()
+}
+
+/// Left, Either, or Right for a modifier-only shortcut (macOS), before its
+/// recorder; sides that would collide with another shortcut are disabled.
+pub(super) const SIDE_PICKER_WIDTH: f32 = 180.0;
+
+pub(super) fn side_selector(ui: &Ui, p: Paint, target: ShortcutTarget) -> Option<El> {
+    let side = picked_side(ui, target)?;
     let key = match target {
         ShortcutTarget::Dictation => "dictation-side",
         ShortcutTarget::PasteLast => "paste-last-side",
         ShortcutTarget::VoiceAction => "voice-action-side",
+        #[cfg(hex_capture)]
+        ShortcutTarget::Capture => "capture-side",
+        #[cfg(hex_capture)]
+        ShortcutTarget::CaptureList => "capture-list-side",
     };
     let labels = [tr("Left"), tr("Either"), tr("Right")];
     let selected = SIDES.iter().position(|s| *s == side).unwrap_or(1);
     let mut control = rune_kit::SegmentedControl::new(&labels, Some(selected))
-        .width(Some(180.0))
+        .width(Some(SIDE_PICKER_WIDTH))
         .on_pick(move |ui: &mut Ui, index: usize, _: &mut rune::Tx| {
             if let Some(candidate) = side_binding(&ui.settings, target, SIDES[index]) {
                 ui.update(|settings| super::settings::set_binding(settings, target, candidate));

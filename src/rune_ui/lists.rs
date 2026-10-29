@@ -10,10 +10,17 @@ use rune::{
 };
 
 use super::Ui;
-use super::controls::{ButtonKind, DESCRIPTION, Paint, button, pulsing_dot, status_dot};
+use super::controls::{
+    ButtonKind, DESCRIPTION, METRICS, Paint, PushSize, button, pulsing_dot, status_dot,
+};
 use crate::desktop_i18n::tr;
 
 const LIST_WIDTH: f32 = 320.0;
+/// A [`list_row`]'s text inset.
+const LIST_ROW_PX: f32 = 10.0;
+/// A list column's leading padding, which puts its rows' text on the pane
+/// title's edge.
+pub(super) const LIST_COLUMN_PL: f32 = METRICS.gutter - LIST_ROW_PX;
 static CLOSE: &rune::Icon = &rune_theme_opencode::icons::CLOSE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,8 +66,19 @@ pub(super) fn group_label(p: Paint, key: &str, label: &str, first: bool) -> El {
         .font(p.k.ty.small_medium)
         .color(p.faint())
         .px(10.0)
-        .pt(if first { 4.0 } else { 16.0 })
-        .pb(6.0)
+        .pt(group_label_top(first))
+        .pb(GROUP_LABEL_BOTTOM)
+}
+
+const GROUP_LABEL_BOTTOM: f32 = 6.0;
+
+fn group_label_top(first: bool) -> f32 {
+    if first { 4.0 } else { 16.0 }
+}
+
+/// How tall a [`group_label`] is, for a list that lays it out by hand.
+pub(super) fn group_label_height(p: Paint, first: bool) -> f32 {
+    group_label_top(first) + p.k.ty.small_medium.line_px() + GROUP_LABEL_BOTTOM
 }
 
 /// A source list, as in a native sidebar: Tab enters at the selected row,
@@ -69,12 +87,11 @@ pub(super) fn source_list(list: El) -> El {
     list.role("list").focus_group().focus_follows()
 }
 
-/// A row of a [`source_list`]. Its ring is inset because rows touch and
-/// their scroll view clips.
-pub(super) fn source_item(p: Paint, item: El, selected: bool) -> El {
-    item.focusable(true)
-        .focus_selected(selected)
-        .focus_ring(2.0, -2.0, p.k.c.border_focus)
+/// A row of a [`source_list`]. It draws no focus ring: focus follows the
+/// selection, so the selected fill shows where focus is, as in a native
+/// sidebar.
+pub(super) fn source_item(item: El, selected: bool) -> El {
+    item.focusable(true).focus_selected(selected)
 }
 
 /// A selectable list row: title (with trailing pieces) over a meta line.
@@ -92,7 +109,7 @@ pub(super) fn list_row(
         .key(key)
         .role("button")
         .label(title)
-        .px(10.0)
+        .px(LIST_ROW_PX)
         .py(8.0)
         .gap(2.0)
         .radius(p.k.radius.md)
@@ -125,7 +142,7 @@ pub(super) fn list_row(
     if selected {
         item = item.fill(c.layer_02);
     }
-    source_item(p, item, selected)
+    source_item(item, selected)
 }
 
 /// A quiet message in a list or detail (empty, no matches, failed load).
@@ -183,7 +200,7 @@ pub(super) fn split(p: Paint, key: &str, list: El, detail: El) -> El {
                 .key("list-column")
                 .w(LIST_WIDTH)
                 .h_full()
-                .pl(16.0)
+                .pl(LIST_COLUMN_PL)
                 .pr(8.0)
                 .child(list),
         )
@@ -506,21 +523,20 @@ pub(super) fn small_button(
 ) -> El {
     rune_kit::Button::new(label)
         .variant(rune_kit::ButtonVariant::Neutral)
-        .size(rune_kit::ButtonSize::Small)
         .on_press_tx(press)
-        .build(p.k)
+        .build_small_push(p.k)
         .key(key)
 }
 
 /// The × that removes one item of an editable list.
 pub(super) fn remove_button(
     p: Paint,
-    size: rune_kit::ButtonSize,
+    size: rune_kit::ControlSize,
     press: impl Fn(&mut Ui) + 'static,
 ) -> El {
     rune_kit::IconButton::new(CLOSE)
         .variant(rune_kit::IconButtonVariant::Ghost)
-        .size(size)
+        .control_size(size)
         .label(tr("Remove"))
         .on_press(press)
         .build(p.k)
@@ -529,7 +545,8 @@ pub(super) fn remove_button(
 
 /// A horizontal slider: the label and value over a track you press or drag.
 /// `set` gets the position from zero through one and whether the gesture
-/// ended (save then, not on every move).
+/// ended (save then, not on every move). A cancelled drag (Escape, window
+/// blur) puts the value from the press back and never saves.
 pub(super) fn slider(
     p: Paint,
     key: &str,
@@ -538,6 +555,19 @@ pub(super) fn slider(
     display: String,
     width: f32,
     set: impl Fn(&mut Ui, f32, bool) + 'static,
+) -> El {
+    slider_in(p, key, label, value, display, width, set)
+}
+
+/// A [`slider`] for a window whose state isn't [`Ui`].
+pub(super) fn slider_in<S: 'static>(
+    p: Paint,
+    key: &str,
+    label: &str,
+    value: f32,
+    display: String,
+    width: f32,
+    set: impl Fn(&mut S, f32, bool) + 'static,
 ) -> El {
     let c = &p.k.c;
     let value = value.clamp(0.0, 1.0);
@@ -549,12 +579,17 @@ pub(super) fn slider(
         .w(width)
         .h(22.0)
         .center_y()
-        .on_drag(
-            move |ui: &mut Ui, drag: &mut rune::Drag, _: &mut rune::Tx| {
-                let position = ((drag.x - knob / 2.0) / (drag.w - knob).max(1.0)).clamp(0.0, 1.0);
-                set(ui, position, drag.phase == rune::Phase::Up);
-            },
-        )
+        .on_drag(move |ui: &mut S, drag: &mut rune::Drag, _: &mut rune::Tx| {
+            if drag.phase == rune::Phase::Down {
+                drag.data = value;
+            }
+            if drag.cancelled() {
+                set(ui, drag.data, false);
+                return;
+            }
+            let position = ((drag.x - knob / 2.0) / (drag.w - knob).max(1.0)).clamp(0.0, 1.0);
+            set(ui, position, drag.phase == rune::Phase::Up);
+        })
         .child(
             row()
                 .key("rail")

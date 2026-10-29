@@ -207,6 +207,20 @@ pub enum WindowCommand {
         #[command(flatten)]
         output: Output,
     },
+    /// Experiment: open the window on a playground story by its path, name,
+    /// or slug (`HUD/Processing`, `hud-processing`; `hex experiments enable
+    /// playground`).
+    Story {
+        story: String,
+        /// The variant, by number from 1 or by name.
+        #[arg(long)]
+        variant: Option<String>,
+        /// Run the story's `r` trigger once it's open, as pressing R does.
+        #[arg(long)]
+        play: bool,
+        #[command(flatten)]
+        output: Output,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -293,6 +307,19 @@ pub fn run(command: ControlCli) -> u8 {
                 send(ControlCommand::WindowShow { pane }, output)
             }
             WindowCommand::Hide { output } => send(ControlCommand::WindowHide, output),
+            WindowCommand::Story {
+                story,
+                variant,
+                play,
+                output,
+            } => send(
+                ControlCommand::WindowStory {
+                    story,
+                    variant,
+                    play,
+                },
+                output,
+            ),
         },
         ControlCli::CheckForUpdates { output } => send(ControlCommand::CheckForUpdates, output),
         ControlCli::LaunchAtLogin { state, output } => send(
@@ -323,6 +350,140 @@ pub fn run(command: ControlCli) -> u8 {
             lines,
             follow,
         } => logs(process, lines, follow),
+    }
+}
+
+/// `hex capture` (the `capture` experiment).
+#[cfg(hex_capture)]
+#[derive(Subcommand)]
+pub enum CaptureCommand {
+    /// Start recording a capture.
+    Start {
+        #[command(flatten)]
+        output: Output,
+    },
+    /// End the capture and write it in the background.
+    Stop {
+        #[command(flatten)]
+        output: Output,
+    },
+    /// End the capture and discard it.
+    Cancel {
+        #[command(flatten)]
+        output: Output,
+    },
+    /// What records, what is being written, and the last capture.
+    Status {
+        #[command(flatten)]
+        output: Output,
+    },
+    /// The newest captures, newest first.
+    List {
+        /// How many to show (20 unless given).
+        #[arg(long)]
+        limit: Option<usize>,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// One capture's words, files, and where it went.
+    Show {
+        /// A bundle name, path, or `latest`.
+        capture: String,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Send a capture to an OpenCode session.
+    Send {
+        /// A bundle name, path, or `latest`.
+        capture: String,
+        /// A session ID, or for the newest capture a session its route
+        /// lists by name. Without it, where its route or last send says.
+        #[arg(long)]
+        to: Option<String>,
+        /// Also save a rule that always sends this capture's site or app
+        /// there (the newest routed capture only).
+        #[arg(long)]
+        always: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// What routing sees for a capture and what it decides (Scrawl's
+    /// `route --explain`). Sends nothing.
+    Route {
+        /// A bundle name, path, or `latest`.
+        capture: String,
+        /// Accepted for Scrawl's spelling; `route` only ever explains.
+        #[arg(long, hide = true)]
+        explain: bool,
+        /// Ask Jev again now (one call).
+        #[arg(long)]
+        ask_jev: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+}
+
+/// Runs `hex capture`: on macOS through the running Hex; on Linux the
+/// folder reads (`list`, `show`, `route`, `send`) run here, and the
+/// recording commands go to the running Hex's listener.
+#[cfg(hex_capture)]
+pub fn capture(command: CaptureCommand) -> u8 {
+    use crate::control::{ControlCommand as C, ScrawlCaptureAction as A};
+    let (command, output) = match command {
+        CaptureCommand::Start { output } => (C::ScrawlCapture { action: A::Start }, output),
+        CaptureCommand::Stop { output } => (C::ScrawlCapture { action: A::Stop }, output),
+        CaptureCommand::Cancel { output } => (C::ScrawlCapture { action: A::Cancel }, output),
+        CaptureCommand::Status { output } => (C::ScrawlCapture { action: A::Status }, output),
+        CaptureCommand::List { limit, output } => (C::ScrawlCaptureList { limit }, output),
+        CaptureCommand::Show { capture, output } => (C::ScrawlCaptureShow { capture }, output),
+        CaptureCommand::Send {
+            capture,
+            to,
+            always,
+            output,
+        } => (
+            C::ScrawlCaptureSend {
+                capture,
+                to,
+                always,
+            },
+            output,
+        ),
+        CaptureCommand::Route {
+            capture,
+            explain: _,
+            ask_jev,
+            output,
+        } => (C::ScrawlCaptureRoute { capture, ask_jev }, output),
+    };
+    #[cfg(target_os = "macos")]
+    return send(command, output);
+    #[cfg(target_os = "linux")]
+    {
+        if !crate::app_settings::capture_available() {
+            return print(
+                ControlReply::error(
+                    "feature-off",
+                    "captures need the `capture` experiment; run `hex experiments enable capture` and restart Hex",
+                ),
+                output,
+            );
+        }
+        let reply = match command {
+            C::ScrawlCaptureList { limit } => crate::capture_host::list_captures(limit),
+            C::ScrawlCaptureShow { capture } => crate::capture_host::show_capture(&capture),
+            C::ScrawlCaptureSend {
+                capture,
+                to,
+                always,
+            } => crate::capture_host::send_capture(&capture, to, always),
+            C::ScrawlCaptureRoute { capture, ask_jev } => {
+                crate::capture_host::explain_capture(&capture, ask_jev)
+            }
+            C::ScrawlCapture { action } => Ok(crate::linux_service::capture(action)),
+            _ => unreachable!("only capture commands"),
+        };
+        print(reply.unwrap_or_else(ControlReply::from), output)
     }
 }
 
@@ -614,9 +775,143 @@ fn print(reply: ControlReply, output: Output) -> u8 {
         ControlReply::Settings { settings } => print!("{}", human_settings(&settings)),
         ControlReply::Models { models } => print!("{}", human_models(&models)),
         ControlReply::Vocabulary { entries } => print!("{}", human_vocabulary(&entries)),
+        ControlReply::ScrawlCapture(report) => print!("{}", human_scrawl_capture(&report)),
+        ControlReply::ScrawlCaptures { captures } => print!("{}", human_captures(&captures)),
+        ControlReply::ScrawlCaptureDetail(detail) => print!("{}", human_capture_detail(&detail)),
+        ControlReply::ScrawlCaptureRoute { explanation } => print!("{explanation}"),
         ControlReply::Error { message, .. } => eprintln!("hex: {message}"),
     }
     code
+}
+
+fn human_scrawl_capture(report: &super::ScrawlCaptureReport) -> String {
+    use super::ScrawlCaptureState;
+    let mut out = String::new();
+    let bundle = |bundle: &Option<std::path::PathBuf>| {
+        bundle
+            .as_ref()
+            .map_or_else(String::new, |bundle| bundle.display().to_string())
+    };
+    match (report.state, report.changed) {
+        (ScrawlCaptureState::Recording, true) => {
+            out.push_str(&format!("Capturing into {}\n", bundle(&report.bundle)));
+        }
+        (ScrawlCaptureState::Recording, false) => out.push_str(&format!(
+            "Capturing into {} ({} ms)\n",
+            bundle(&report.bundle),
+            report.elapsed_ms.unwrap_or_default()
+        )),
+        (ScrawlCaptureState::Idle, true) => {
+            out.push_str(&format!("Ended the capture {}\n", bundle(&report.bundle)));
+        }
+        (ScrawlCaptureState::Idle, false) => out.push_str("No capture is recording\n"),
+    }
+    for finishing in &report.finishing {
+        out.push_str(&format!("Writing {}\n", finishing.display()));
+    }
+    if let Some(last) = &report.last {
+        let words = last
+            .words
+            .map_or_else(String::new, |words| format!(", {words} words"));
+        let gaps = last
+            .gaps
+            .filter(|gaps| *gaps > 0)
+            .map_or_else(String::new, |gaps| format!(", {gaps} audio gaps"));
+        let missing = last
+            .missing_transcript
+            .as_ref()
+            .map_or_else(String::new, |why| format!(", no transcript ({why})"));
+        out.push_str(&format!(
+            "Last: {} {}{words}{gaps}{missing}\n",
+            last.stage,
+            last.bundle.display()
+        ));
+    }
+    out
+}
+
+fn human_captures(captures: &[super::ScrawlCaptureSummary]) -> String {
+    if captures.is_empty() {
+        return "No captures\n".into();
+    }
+    captures
+        .iter()
+        .map(|capture| format!("{}\n", capture_line(capture)))
+        .collect()
+}
+
+/// `1792933491953.scrawl  2026-10-26 14:02  0:04  window · Brave  12 words  → Hex`
+fn capture_line(capture: &super::ScrawlCaptureSummary) -> String {
+    let seconds = capture.duration_ms / 1_000;
+    let mut line = format!(
+        "{}  {}  {}:{:02}  {}",
+        capture.id,
+        local_minute(capture.created_at_ms),
+        seconds / 60,
+        seconds % 60,
+        capture.mode
+    );
+    if let Some(app) = &capture.app {
+        line.push_str(&format!(" · {app}"));
+    }
+    line.push_str(&format!("  {} words", capture.words));
+    if let Some(sent) = &capture.sent_to {
+        line.push_str(&format!("  → {}", sent.title));
+    }
+    if capture.queued {
+        line.push_str(" (queued)");
+    }
+    line
+}
+
+fn human_capture_detail(detail: &super::ScrawlCaptureDetail) -> String {
+    let mut out = format!(
+        "{}\n{}\n",
+        capture_line(&detail.summary),
+        detail.summary.bundle.display()
+    );
+    if let Some(title) = &detail.window_title {
+        out.push_str(&format!("Window: {title}\n"));
+    }
+    if let Some(sent) = &detail.summary.sent_to {
+        out.push_str(&format!("Sent to: {} ({})\n", sent.title, sent.session));
+    }
+    out.push_str(&format!(
+        "{} marks, {} keyframes\n",
+        detail.marks, detail.keyframes
+    ));
+    for (label, path) in [
+        ("Video", &detail.video),
+        ("Audio", &detail.audio),
+        ("Contact sheet", &detail.contact_sheet),
+    ] {
+        if let Some(path) = path {
+            out.push_str(&format!("{label}: {}\n", path.display()));
+        }
+    }
+    if let Some(note) = &detail.note {
+        out.push_str(&format!("\nNote: {note}\n"));
+    }
+    match (&detail.missing_transcript, detail.transcript.trim()) {
+        (Some(why), _) => out.push_str(&format!("\nNo transcript: {why}\n")),
+        (None, "") => out.push_str("\nNo words\n"),
+        (None, text) => out.push_str(&format!("\n{text}\n")),
+    }
+    out
+}
+
+/// `2026-10-26 14:02` in local time where Hex knows it.
+fn local_minute(ms: u64) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let iso = crate::meeting::query::iso_local(ms);
+        iso.get(..16)
+            .map_or(iso.clone(), |minute| minute.replace('T', " "))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("{ms} ms")
+    }
 }
 
 pub fn exit_code(reply: &ControlReply) -> u8 {
@@ -784,9 +1079,8 @@ fn human_status(report: &StatusReport) -> String {
         "ready".to_string()
     } else {
         format!(
-            "microphone {}, input monitoring {}, accessibility {}, model {}",
+            "microphone {}, accessibility {}, model {}",
             permissions.microphone,
-            permissions.input_monitoring,
             permissions.accessibility,
             if permissions.transcription_model {
                 "ready"

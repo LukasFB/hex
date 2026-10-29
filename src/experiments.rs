@@ -1,4 +1,4 @@
-//! Experiments: unfinished features that stay dormant on `main` until a
+//! Experiments: unfinished features that stay dormant on `dev` until a
 //! person turns them on for their own Hex. They are unsupported and may
 //! change or disappear without notice.
 //!
@@ -7,7 +7,8 @@
 //! name per line, `#` comments). The process reads them once, on first use,
 //! so changes apply at the next launch. Unknown names are logged and ignored.
 //! Debug builds read the same sources; `DEVELOPER_FEATURES_ENABLED` turns
-//! nothing on.
+//! nothing on. An experiment a platform has no code for (`capture` on
+//! Windows) is not listed there, cannot be enabled, and its name is unknown.
 //!
 //! Gate an experiment where it starts (the worker, thread, or capture that
 //! does its work), not only where its UI shows: a hidden pane whose worker
@@ -27,24 +28,52 @@ pub const ENV: &str = "HEX_EXPERIMENTS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Experiment {
+    Capture,
+    DotScope,
     LiveChapters,
+    Modes,
+    Playground,
     SmartTurn,
     Vocabulary,
     VoiceFilter,
 }
 
 impl Experiment {
-    pub const ALL: [Self; 4] = [
+    /// Every experiment, including those a platform lacks;
+    /// [`Self::available`] lists the ones this build offers.
+    const ALL: [Self; 8] = [
+        Self::Capture,
+        Self::DotScope,
         Self::LiveChapters,
+        Self::Modes,
+        Self::Playground,
         Self::SmartTurn,
         Self::Vocabulary,
         Self::VoiceFilter,
     ];
 
+    /// The experiments this build offers: `capture` only where it has a
+    /// host.
+    pub fn available() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|experiment| experiment.offered())
+    }
+
+    /// Whether this build has the experiment's code: `capture` on macOS
+    /// and Linux.
+    const fn offered(self) -> bool {
+        !matches!(self, Self::Capture) || cfg!(hex_capture)
+    }
+
     /// The stable name the env variable, the file, and the CLI use.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Capture => "capture",
+            Self::DotScope => "dot-scope",
             Self::LiveChapters => "live-chapters",
+            Self::Modes => "modes",
+            Self::Playground => "playground",
             Self::SmartTurn => "smart-turn",
             Self::Vocabulary => "vocabulary",
             Self::VoiceFilter => "voice-filter",
@@ -53,7 +82,17 @@ impl Experiment {
 
     pub const fn description(self) -> &'static str {
         match self {
+            Self::Capture => "Scrawl's capture engine (`hex capture`; macOS and Linux).",
+            Self::DotScope => {
+                "Dot scope: the recording indicator as a braided dot oscilloscope (macOS, Linux, Windows; tuned in HUD Lab)."
+            }
             Self::LiveChapters => "Chapter a meeting's transcript live while it records.",
+            Self::Modes => {
+                "Modes: the pane, per-app corrections, OpenCode rewriting, and transformations."
+            }
+            Self::Playground => {
+                "Rune's playground in the window (⇧⌘D, Ctrl+Shift+D off macOS): every fixture scene and story."
+            }
             Self::SmartTurn => {
                 "Stop hands-free dictation when Smart Turn hears you finish (macOS)."
             }
@@ -64,10 +103,10 @@ impl Experiment {
         }
     }
 
+    /// The offered experiment called `name`; one this build lacks is
+    /// unknown.
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|experiment| experiment.name() == name)
+        Self::available().find(|experiment| experiment.name() == name)
     }
 
     fn index(self) -> usize {
@@ -212,13 +251,11 @@ impl Snapshot {
     }
 
     fn enabled(&self, experiment: Experiment) -> bool {
-        self.sources[experiment.index()].any()
+        experiment.offered() && self.sources[experiment.index()].any()
     }
 
     fn active(&self) -> impl Iterator<Item = Experiment> + '_ {
-        Experiment::ALL
-            .into_iter()
-            .filter(|experiment| self.enabled(*experiment))
+        Experiment::available().filter(|experiment| self.enabled(*experiment))
     }
 }
 
@@ -339,7 +376,10 @@ pub fn run(command: &ExperimentsCommand) -> Result<()> {
             let experiment = Experiment::from_name(name).ok_or_else(|| {
                 eyre!(
                     "unknown experiment {name:?}; known experiments: {}",
-                    Experiment::ALL.map(Experiment::name).join(", ")
+                    Experiment::available()
+                        .map(Experiment::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             })?;
             let state = if on { "on" } else { "off" };
@@ -374,12 +414,11 @@ const RESTART_HINT: &str = "Restart Hex to apply it: hex restart";
 const RESTART_HINT: &str = "Quit and reopen Hex to apply it.";
 
 fn print_list(out: &mut impl std::io::Write, snapshot: &Snapshot, path: &Path) -> Result<()> {
-    let width = Experiment::ALL
+    let width = Experiment::available()
         .map(|experiment| experiment.name().len())
-        .into_iter()
         .max()
         .unwrap_or_default();
-    for experiment in Experiment::ALL {
+    for experiment in Experiment::available() {
         let sources = snapshot.sources[experiment.index()];
         let source = match sources.labels().join("+") {
             labels if labels.is_empty() => "-".to_string(),
@@ -430,8 +469,7 @@ fn list_json<'a>(snapshot: &'a Snapshot, path: &Path) -> ListJson<'a> {
     ListJson {
         version: 1,
         file: path.to_path_buf(),
-        experiments: Experiment::ALL
-            .into_iter()
+        experiments: Experiment::available()
             .map(|experiment| {
                 let sources = snapshot.sources[experiment.index()];
                 ExperimentJson {
@@ -461,7 +499,8 @@ mod tests {
     #[test]
     fn names_round_trip_and_stay_kebab_case() {
         for experiment in Experiment::ALL {
-            assert_eq!(Experiment::from_name(experiment.name()), Some(experiment));
+            let expected = experiment.offered().then_some(experiment);
+            assert_eq!(Experiment::from_name(experiment.name()), expected);
             assert!(
                 experiment
                     .name()
@@ -513,6 +552,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn capture_exists_only_where_it_has_a_host() {
+        let built = cfg!(hex_capture);
+        let offered = Experiment::available().any(|experiment| experiment == Experiment::Capture);
+        assert_eq!(offered, built);
+        assert_eq!(Experiment::from_name("capture").is_some(), built);
+
+        let snapshot = Snapshot::parse(Some("capture"), Some("capture\n"));
+        assert_eq!(snapshot.enabled(Experiment::Capture), built);
+        assert_eq!(
+            snapshot.unknown.is_empty(),
+            built,
+            "Windows treats `capture` as unknown"
+        );
+        let listed = list_json(&snapshot, Path::new("/x"))
+            .experiments
+            .iter()
+            .any(|experiment| experiment.name == "capture");
+        assert_eq!(listed, built);
     }
 
     #[test]
@@ -611,7 +671,12 @@ mod tests {
     fn list_reports_each_source() {
         let snapshot = Snapshot::parse(Some("vocabulary"), Some("vocabulary\nmystery\n"));
         let path = Path::new("/home/kit/.config/hex/experiments");
-        let json = serde_json::to_value(list_json(&snapshot, path)).unwrap();
+        let mut json = serde_json::to_value(list_json(&snapshot, path)).unwrap();
+        if cfg!(hex_capture) {
+            let first = json["experiments"].as_array_mut().unwrap().remove(0);
+            assert_eq!(first["name"], "capture");
+            assert_eq!(first["enabled"], false);
+        }
         assert_eq!(
             json,
             serde_json::json!({
@@ -619,8 +684,26 @@ mod tests {
                 "file": "/home/kit/.config/hex/experiments",
                 "experiments": [
                     {
+                        "name": "dot-scope",
+                        "description": Experiment::DotScope.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
                         "name": "live-chapters",
                         "description": Experiment::LiveChapters.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
+                        "name": "modes",
+                        "description": Experiment::Modes.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
+                        "name": "playground",
+                        "description": Experiment::Playground.description(),
                         "enabled": false,
                         "sources": [],
                     },

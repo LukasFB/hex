@@ -8,7 +8,9 @@ use rune::{El, TextEdit, Tx, col, row, text};
 use rune_kit::TextInput;
 
 use super::Ui;
-use super::controls::{ButtonKind, DESCRIPTION, Paint, button, card, setting_row, toggle_row};
+use super::controls::{
+    ButtonKind, DESCRIPTION, METRICS, Paint, button, card, setting_row, toggle_row,
+};
 use super::lists::{
     detail_header, detail_title, error_panel, fact, group_label, list_row, message, placeholder,
     source_list, split,
@@ -98,10 +100,10 @@ fn agent_prompt(workspace: &str) -> String {
         "Help me configure my Hex custom voice commands.\n\n\
          Workspace: {workspace}\n\
          Config: {workspace}/hex.config.ts\n\n\
-         Read AGENTS.md and .agents/skills/personal-commands/SKILL.md in the workspace \
-         before editing. Ask me what commands or dictation phrases I want, update \
-         hex.config.ts, and run `bun run check` from the workspace when finished. You \
-         may add npm packages when a command needs them."
+         Read AGENTS.md in the workspace before editing. Ask me what commands or \
+         dictation phrases I want, update hex.config.ts, and run `hex commands check` \
+         when finished. Hex runs the config itself: no npm packages, filesystem, or \
+         network."
     )
 }
 
@@ -241,8 +243,7 @@ pub(super) fn pane(ui: &Ui, p: Paint) -> (Vec<El>, El) {
             .child(
                 col()
                     .key("notices")
-                    .px(24.0)
-                    .pt(4.0)
+                    .px(METRICS.gutter)
                     .pb(12.0)
                     .gap(8.0)
                     .children(top),
@@ -284,13 +285,16 @@ fn enable_card(ui: &Ui, p: Paint) -> El {
                         ButtonKind::Secondary,
                         |ui: &mut Ui, _| ui.commands.confirm_enable = false,
                     ))
-                    .child(button(
-                        p,
-                        "confirm-enable-commands",
-                        tr("Keep microphone ready & enable commands"),
-                        ButtonKind::Primary,
-                        |ui: &mut Ui, _| keep_ready_and_enable(ui),
-                    )),
+                    .child(
+                        button(
+                            p,
+                            "confirm-enable-commands",
+                            tr("Keep microphone ready & enable commands"),
+                            ButtonKind::Primary,
+                            |ui: &mut Ui, _| keep_ready_and_enable(ui),
+                        )
+                        .default_button(),
+                    ),
             )
             .fill(p.k.c.hover),
         );
@@ -382,7 +386,7 @@ fn detail(ui: &Ui, p: Paint, command: Option<&CatalogCommand>) -> El {
         .key("command-detail")
         .grow(1.0)
         .shrink()
-        .px(24.0)
+        .px(METRICS.gutter)
         .pb(16.0)
         .child(detail_header(
             detail_title(p, &command.phrase),
